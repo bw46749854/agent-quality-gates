@@ -1,0 +1,58 @@
+# 品質ゲート。`python3 tools/verify.py` が上から順に実行する。
+# 完了時（change close）・コミット前・CI のすべてが、この同じ定義を使う。
+#
+# ルール:
+# - cmd が終了コード 0 で終われば合格。
+# - cmd を空のままにする場合は、skip_reason に理由を必ず書く。
+#   cmd も skip_reason も空のゲートは「未設定」として不合格になる（黙って飛ばさないため）。
+# - トレーサビリティ検査（tools/tracekit.py check）は、ここに書かなくても必ず最初に実行される。
+# - id がテストのレベル名（trace/config.toml の [tests] のキー）と同じゲートは、そのレベルのテストを
+#   実行するものとして扱う。1つのコマンドが複数のレベルをまとめて実行する場合は、
+#   levels = ["unit", "integration"] のように書く。
+#   実装済みの要件が求めるレベルを、どのゲートも実行していなければ、検査がエラーにする（LEVEL-NOT-RUN）。
+#   テストがあっても、実行されなければ検証したことにならないため。
+# - timeout = 600 のように、秒で時間切れを指定できる（既定は 1800）。
+#
+# 言語ごとの設定例は adapters/README.md を参照。
+
+[[gate]]
+id = "static"
+name = "静的解析"
+cmd = ""
+skip_reason = ""
+
+[[gate]]
+id = "types"
+name = "型検査"
+cmd = ""
+skip_reason = ""
+
+[[gate]]
+id = "architecture"
+name = "アーキテクチャテスト（依存ルールの厳密な検査）"
+cmd = ""
+skip_reason = ""
+
+[[gate]]
+id = "unit"
+name = "単体テスト"
+cmd = ""
+skip_reason = ""
+
+[[gate]]
+id = "integration"
+name = "結合テスト"
+cmd = ""
+skip_reason = ""
+
+[[gate]]
+id = "e2e"
+name = "E2Eテスト"
+cmd = ""
+skip_reason = ""
+
+[[gate]]
+id = "contract"
+name = "契約テスト"
+cmd = ""
+skip_reason = ""

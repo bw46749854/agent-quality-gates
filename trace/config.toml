@@ -1,0 +1,30 @@
+# 台帳の設定。プロジェクトの配置に合わせて書き換える。
+# パスはすべてリポジトリのルートからの相対パス。glob は `*`（1階層）と `**`（複数階層）が使える。
+
+# 本番コードを置く場所。この配下のファイルは、必ずどれか1つのコンポーネントに属さなければならない。
+source_roots = ["src"]
+
+# 検査の対象から外すパス（生成物、サンプルなど）。
+ignore = ["examples/**"]
+
+requirements_dir = "docs/requirements"
+changes_dir = "docs/changes"
+matrix_file = "docs/traceability.md"
+
+# テストのレベルと、そのレベルに属するファイル。
+# キーがそのままレベル名になる（要件の `verify:` に書く名前）。performance など独自のレベルを足してよい。
+# 本番コードと同じ場所にテストを置く言語では、たとえば unit = ["src/**/*_test.go"] のように書く。
+# フィクスチャなどテストでないファイルが混ざる場合は、glob を絞る（例: "tests/unit/**/test_*.py"）。
+[tests]
+unit = ["tests/unit/**"]
+integration = ["tests/integration/**"]
+e2e = ["tests/e2e/**"]
+contract = ["tests/contract/**"]
+
+# 粒度の警告。要件が min_requirements 件以上になってから働く。
+[granularity]
+min_requirements = 5
+# 1つのコンポーネントを変えたとき、全要件のうちこの割合を超えて影響するなら「粗すぎる」と警告する。
+max_requirement_share = 0.6
+# 1つの要件がこの数を超えるコンポーネントにまたがるなら「散らばりすぎ」と警告する。
+max_components_per_requirement = 4

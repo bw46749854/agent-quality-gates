@@ -1,0 +1,21 @@
+# コンポーネントの台帳。「どのコードがどのコンポーネントか」と「依存してよい向き」の正本。
+#
+# - コードとコンポーネントの対応は paths（置き場所）で決まる。コードの中にIDは書かない。
+# - depends_on に書いていない相手への依存は、検査でエラーになる。循環もエラーになる。
+# - reference_patterns は「他のコンポーネントがここを参照するとき、コード上の1行に現れる形」を
+#   正規表現で書く。書いておくと、宣言していない依存を言語に関係なく検出できる。
+#   より厳密に調べたいときは、言語ごとの専用ツールを trace/gates.toml の architecture に設定する。
+#
+# 例:
+#
+# [[component]]
+# id = "COMP-ORDER"
+# name = "注文管理"
+# responsibility = "注文の受付・取消と、注文の状態を管理する"
+# paths = ["src/order/**"]
+# depends_on = ["COMP-INVENTORY"]
+# reference_patterns = ['^\s*(from|import)\s+order\b']
+#
+# 省略できる項目:
+#   status = "planned"   # まだコードがない設計段階のコンポーネント（既定は "active"）
+#   shared = true        # 意図して多くのコンポーネントから使われる共有基盤（粒度の警告を出さない）

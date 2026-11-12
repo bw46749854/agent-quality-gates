@@ -1,0 +1,29 @@
+[[gate]]
+id = "static"
+name = "静的解析"
+cmd = "python3 -m compileall -q src tests"
+
+[[gate]]
+id = "types"
+name = "型検査"
+skip_reason = "サンプルを標準ライブラリだけで動かすため。実プロジェクトでは mypy などを設定する"
+
+[[gate]]
+id = "architecture"
+name = "アーキテクチャテスト"
+skip_reason = "依存ルールは tracekit の reference_patterns による検査で確認している"
+
+[[gate]]
+id = "unit"
+name = "単体テスト"
+cmd = "PYTHONPATH=src python3 -m unittest discover -s tests/unit -q"
+
+[[gate]]
+id = "integration"
+name = "結合テスト"
+cmd = "PYTHONPATH=src python3 -m unittest discover -s tests/integration -q"
+
+[[gate]]
+id = "e2e"
+name = "E2Eテスト"
+skip_reason = "画面も外部公開のAPIもないライブラリのため、結合テストが最上位の検証になる"

@@ -1,0 +1,6 @@
+# サンプルの設定。既定値と同じだが、何を決めているかが見えるように書いてある。
+source_roots = ["src"]
+
+[tests]
+unit = ["tests/unit/**/test_*.py"]
+integration = ["tests/integration/**/test_*.py"]

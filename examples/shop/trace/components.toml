@@ -1,0 +1,15 @@
+[[component]]
+id = "COMP-INVENTORY"
+name = "在庫管理"
+responsibility = "在庫数の確認・引当・解放を行い、在庫数が負にならないことを保証する"
+paths = ["src/inventory/**"]
+depends_on = []
+reference_patterns = ['^\s*(from|import)\s+inventory\b']
+
+[[component]]
+id = "COMP-ORDER"
+name = "注文管理"
+responsibility = "注文の受付・取消と、注文の状態を管理する"
+paths = ["src/order/**"]
+depends_on = ["COMP-INVENTORY"]
+reference_patterns = ['^\s*(from|import)\s+order\b']

@@ -1,0 +1,16 @@
+#!/bin/sh
+# コミット前の検査。エージェントの種類に関係なく働く。
+# 有効にする: git config core.hooksPath tools/git-hooks
+# （リポジトリの一部だけに入れた場合は、git のルートからのパスで指定する。例: services/shop/tools/git-hooks）
+#
+# 速い検査だけを行う。テストの実行を含む全ゲートは、完了時（change close）と CI が受け持つ。
+set -e
+# プロジェクトのルートは、この hook の場所から決める（git のルートと同じとは限らない）
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+
+# 台帳・コード・テストの整合（生成物のマトリクスが古くないかも含む）
+"$py" "$root/tools/tracekit.py" check
+
+# ステージした本番コードと要件の変更が、影響分析済みの変更記録の範囲に入っているか
+"$py" "$root/tools/tracekit.py" guard --staged

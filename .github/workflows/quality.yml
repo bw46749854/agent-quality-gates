@@ -1,0 +1,46 @@
+# 品質ゲート。手元の hook を通らなかった変更（別のエージェント、手作業、シェル経由の編集）もここで止める。
+# GitHub Actions 以外の CI を使う場合も、実行する内容は下の3つのコマンドと同じ。
+name: quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 差分から変更の範囲を調べるため、履歴を取る
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # tools/ は標準ライブラリだけで動く（3.11 以上）
+
+      # ここに、プロジェクトの言語の準備と依存の取得を足す。
+      # trace/gates.toml のコマンドが動く状態にすること。
+
+      - name: 検査ツール自身のテスト
+        run: python3 -m unittest discover -s tools/tests
+
+      # --strict: 進行中（active）の変更記録も、このプルリクエストで追加・更新されたものだけを有効とみなす。
+      # 閉じ忘れた変更記録が、あとの無関係な変更まで通してしまうのを防ぐ。
+      - name: 変更が影響分析済みの範囲に入っているか
+        if: github.event_name == 'pull_request'
+        run: python3 tools/tracekit.py guard --base "origin/${{ github.base_ref }}" --strict
+
+      - name: 品質ゲート
+        run: python3 tools/verify.py --report quality-report.json
+
+      # 検証の証跡。どのコミットで、どのゲートが、どの結果だったかを残す。
+      - name: 検証結果を保存する
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-report
+          path: |
+            quality-report.json
+            docs/traceability.md
+          if-no-files-found: ignore

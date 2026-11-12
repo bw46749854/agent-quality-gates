@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""PreToolUse (Edit / Write / NotebookEdit): 影響分析のない本番コードの編集を止める。
+"""PreToolUse (Edit / Write / NotebookEdit): 影響分析のない本番コードの編集と、承認のない品質基盤の編集を止める。
 
 本番コード（trace/config.toml の source_roots 配下）を編集できるのは、
 そのコンポーネントを範囲に含む「進行中の変更記録」があるときだけ。
-テスト・ドキュメント・台帳・プロジェクト外のファイルは止めない。
+品質基盤（ゲートの定義、検査ツール、hook、CI、行動規約。tracekit.QUALITY_BASE）を編集できるのは、
+そのパスを quality_base に含み、承認した人（approved_by）を記録した進行中の変更記録があるときだけ
+（コンポーネントを1つも宣言していない導入の途中は、止めない）。
+テスト・ドキュメント・コンポーネントの台帳・プロジェクト外のファイルは止めない。
 
 終了コード 2 で編集をブロックし、標準エラーの内容がエージェントに渡る。
 """
@@ -20,6 +23,9 @@ def main() -> int:
     import tracekit
 
     tracekit.setup_output("utf-8")
+    if os.environ.get("TRACEKIT_PROBE"):  # doctor からの呼び出し。この hook が実際に呼ばれ、止められることを示す
+        print(tracekit.PROBE_MARK, file=sys.stderr)
+        return 2
     try:
         data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
     except ValueError:
@@ -40,8 +46,10 @@ def main() -> int:
     try:
         project = tracekit.Project(root)
     except tracekit.ConfigError as exc:
-        if rel.startswith(("trace/", "docs/", ".claude/", "tools/")):
-            return 0  # 壊れた台帳を直す編集は通す
+        # 壊れた台帳を直す編集と、文書の編集は通す。ゲートの定義や検査ツールは通さない
+        # （台帳を壊しておけば品質基盤を自由に書き換えられる、という抜け道にしない）
+        if rel in ("trace/config.toml", "trace/components.toml") or rel.startswith("docs/"):
+            return 0
         print(f"台帳を読めないため、編集を止めました。先に台帳を直してください: {exc}", file=sys.stderr)
         return 2
     problems = tracekit.guard(project, [rel])

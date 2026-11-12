@@ -17,6 +17,9 @@ def main() -> int:
     import tracekit
 
     tracekit.setup_output("utf-8")
+    if os.environ.get("TRACEKIT_PROBE"):  # doctor からの呼び出し。この hook が実際に呼ばれることを示す
+        print(tracekit.PROBE_MARK)
+        return 0
     try:
         print(tracekit.render_status(tracekit.Project(root)), end="")
     except tracekit.ConfigError as exc:

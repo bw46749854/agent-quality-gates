@@ -12,6 +12,13 @@
 下の道具は、広く使われているものの例です。プロジェクトですでに使っている道具があれば、そちらを設定してください。
 コマンドは、**違反があれば 0 以外の終了コードで終わる**ものにします。
 
+`trace/gates.toml` の例は、そのまま貼って使える形で書いてあります（ファイルの `[[gate]]` を、例の内容で置き換える）。
+例にないゲート（`e2e`・`contract` など）は、使うなら同じ形で足します。
+ゲートを実行しないと決めた場合は、区分（`skip_kind`）・理由（`skip_reason`）・承認した人の名前（`skip_approved_by`）を書きます。
+区分は、確かめる対象がないなら `not_applicable`、対象はあるが一時的に外すなら `waiver`（期限 `skip_until` が必須）です。
+必ず実行させたいゲートには `required = true` と書きます（理由や承認があっても外せなくなります）。
+ここにある例が正しい TOML であることは、検査ツール自身のテストが確かめています。
+
 ## Python
 
 ```toml
@@ -25,11 +32,30 @@ e2e = ["tests/e2e/**/test_*.py"]
 
 ```toml
 # trace/gates.toml
-static       cmd = "ruff check ."
-types        cmd = "mypy src"
-architecture cmd = "lint-imports"            # import-linter。層・独立・禁止の契約を書ける
-unit         cmd = "pytest tests/unit -q"
-integration  cmd = "pytest tests/integration -q"
+[[gate]]
+id = "static"
+name = "静的解析"
+cmd = "ruff check ."
+
+[[gate]]
+id = "types"
+name = "型検査"
+cmd = "mypy src"
+
+[[gate]]
+id = "architecture"
+name = "アーキテクチャテスト"
+cmd = "lint-imports"  # import-linter。層・独立・禁止の契約を書ける
+
+[[gate]]
+id = "unit"
+name = "単体テスト"
+cmd = "pytest tests/unit -q"
+
+[[gate]]
+id = "integration"
+name = "結合テスト"
+cmd = "pytest tests/integration -q"
 ```
 
 `reference_patterns = ['^\s*(from|import)\s+myapp\.order\b']`
@@ -47,12 +73,35 @@ e2e = ["tests/e2e/**/*.spec.ts"]
 
 ```toml
 # trace/gates.toml
-static       cmd = "npx eslint ."
-types        cmd = "npx tsc --noEmit"
-architecture cmd = "npx depcruise src"       # dependency-cruiser。禁止する依存を規則として書ける
-unit         cmd = "npx vitest run src"
-integration  cmd = "npx vitest run tests/integration"
-e2e          cmd = "npx playwright test"
+[[gate]]
+id = "static"
+name = "静的解析"
+cmd = "npx eslint ."
+
+[[gate]]
+id = "types"
+name = "型検査"
+cmd = "npx tsc --noEmit"
+
+[[gate]]
+id = "architecture"
+name = "アーキテクチャテスト"
+cmd = "npx depcruise src"  # dependency-cruiser。禁止する依存を規則として書ける
+
+[[gate]]
+id = "unit"
+name = "単体テスト"
+cmd = "npx vitest run src"
+
+[[gate]]
+id = "integration"
+name = "結合テスト"
+cmd = "npx vitest run tests/integration"
+
+[[gate]]
+id = "e2e"
+name = "E2Eテスト"
+cmd = "npx playwright test"
 ```
 
 `reference_patterns = ['from\s+"(@app|\.\.?(/\.\.)*)/order[/"]']`
@@ -69,11 +118,32 @@ integration = ["test/integration/**/*_test.go"]
 
 ```toml
 # trace/gates.toml
-static       cmd = "golangci-lint run"
-types        skip_reason = "コンパイルが型検査を兼ねる（static と unit の中で行われる）"
-architecture cmd = "arch-go"                 # または golangci-lint の depguard
-unit         cmd = "go test ./internal/... ./cmd/..."
-integration  cmd = "go test ./test/integration/..."
+[[gate]]
+id = "static"
+name = "静的解析"
+cmd = "golangci-lint run"
+
+[[gate]]
+id = "types"
+name = "型検査"
+skip_reason = "コンパイルが型検査を兼ねる（static と unit の中で行われる）"
+skip_kind = "not_applicable"  # 確かめる対象がない。一時的に外すだけなら "waiver" と skip_until
+skip_approved_by = ""  # 承認した人の名前を書く（空のままでは不合格になる）
+
+[[gate]]
+id = "architecture"
+name = "アーキテクチャテスト"
+cmd = "arch-go"  # または golangci-lint の depguard
+
+[[gate]]
+id = "unit"
+name = "単体テスト"
+cmd = "go test ./internal/... ./cmd/..."
+
+[[gate]]
+id = "integration"
+name = "結合テスト"
+cmd = "go test ./test/integration/..."
 ```
 
 `reference_patterns = ['"example\.com/app/internal/order[/"]']`
@@ -101,11 +171,32 @@ integration = ["src/integrationTest/**/*IT.java"]
 
 ```toml
 # trace/gates.toml
-static       cmd = "./gradlew checkstyleMain spotbugsMain"
-types        skip_reason = "コンパイルが型検査を兼ねる"
-architecture cmd = "./gradlew archTest"      # ArchUnit（Kotlin なら Konsist）のテストを別タスクにする
-unit         cmd = "./gradlew test"
-integration  cmd = "./gradlew integrationTest"
+[[gate]]
+id = "static"
+name = "静的解析"
+cmd = "./gradlew checkstyleMain spotbugsMain"
+
+[[gate]]
+id = "types"
+name = "型検査"
+skip_reason = "コンパイルが型検査を兼ねる"
+skip_kind = "not_applicable"  # 確かめる対象がない。一時的に外すだけなら "waiver" と skip_until
+skip_approved_by = ""  # 承認した人の名前を書く（空のままでは不合格になる）
+
+[[gate]]
+id = "architecture"
+name = "アーキテクチャテスト"
+cmd = "./gradlew archTest"  # ArchUnit（Kotlin なら Konsist）のテストを別タスクにする
+
+[[gate]]
+id = "unit"
+name = "単体テスト"
+cmd = "./gradlew test"
+
+[[gate]]
+id = "integration"
+name = "結合テスト"
+cmd = "./gradlew integrationTest"
 ```
 
 `reference_patterns = ['^\s*import\s+com\.example\.order\.']`
@@ -120,7 +211,8 @@ integration  cmd = "./gradlew integrationTest"
 | Ruby | packwerk |
 
 専用の道具がない言語でも、`reference_patterns` による簡易な検査は働きます。その場合は、
-`architecture` ゲートの `skip_reason` に「tracekit の reference_patterns による検査で確認している」と書きます。
+`architecture` ゲートの `skip_kind` を `not_applicable` に、`skip_reason` に
+「tracekit の reference_patterns による検査で確認している」と書き、`skip_approved_by` に、その判断を承認した人の名前を書きます。
 
 ## テストの効き目を確かめる道具（任意）
 

@@ -15,6 +15,7 @@
 | 要件 ⇔ コンポーネント ⇔ コード ⇔ テスト の対応 | 上の2つ ＋ コードの置き場所 ＋ テストに書いた要件ID | `tracekit.py check` |
 | 変更の影響分析 | `docs/changes/CHG-*.md` | hook（記録のない編集を止める）、`tracekit.py guard` |
 | テストによる検証 | テストコードと `trace/gates.toml` | `verify.py`、テストレビュー |
+| 品質基盤（ゲートの定義、台帳、検査ツール、hook、CI、この行動規約） | `trace/gates.toml`、`trace/config.toml`、`trace/components.toml`、`tools/`、`.github/workflows/`、`.claude/`、`AGENTS.md` | hook、`tracekit.py guard`（承認の記録のない変更を止める） |
 
 `docs/traceability.md` は生成物です。手で編集しません。
 
@@ -38,9 +39,10 @@
 - **内容の固まった要件（`draft` 以外）を変えたら、変更記録の `requirements` に入れる。** 受け入れ条件を黙って書き換えない。
 - **変更が済んだら、変更記録を閉じる。** 進行中のまま残した変更記録は、あとの無関係な編集まで通してしまう。
 - **新しいコードは、台帳に宣言されたコンポーネントの置き場所に置く。** どこにも属さない場所に置きたくなったら、それは設計の変更なので、設計に戻る。
-- **宣言していない依存を作らない。** 必要になったら、動かすために黙って足すのではなく、設計の変更として `trace/components.toml` と `docs/architecture.md` を更新し、理由を残す。
+- **宣言していない依存を作らない。** 必要になったら、動かすために黙って足すのではなく、設計の変更として `trace/components.toml` と `docs/architecture.md` を更新し、理由を残す。台帳（`trace/components.toml`）は品質基盤なので、変える前に利用者の承認を得る。
 - **テストには、検証する受け入れ条件を `REQ-001/AC-2` の形で書く。** 要件の裏づけがないテストや、テストの裏づけがない受け入れ条件を残さない。
 - **テストが失敗したら、原因を調べる。** テストを消す、期待値を実装に合わせて書き換える、モックに置き換えて通す、といった方法で合格にしない。
+- **品質基盤を、自分の判断で変えない。** ゲートのコマンドを軽いものに差し替える、ゲートを外す、台帳に依存を足して検査を通す、台帳や本番コードの置き場所を空にして検査の対象を減らす、検査ツールや hook や CI を書き換える、といった変更は、検査そのものを弱める。必要になったら、何をなぜ変えるのかを利用者に説明して承認を得てから、変更記録の `quality_base` にそのパスを、`approved_by` に承認した人の名前を書く。**承認を得ていない人の名前を書かない。**
 - **原則を機械的に当てはめて、抽象化を増やさない。** インターフェースや層を足すときは、いまある具体的な理由（差し替える必要、依存の向き、テストのしやすさ）を説明できること。
 
 ## 人に確認すること
@@ -50,7 +52,8 @@
 - 要件の解釈が複数あり、どれを選ぶかで作るものが変わるとき
 - コンポーネントの追加・分割・統合、依存の向きの変更など、設計の骨格を変えるとき
 - 既存の要件や受け入れ条件を変える・廃止する必要が出たとき
-- 品質ゲートを `skip_reason` で外す必要が出たとき
+- 品質ゲートを外す必要が出たとき（`required = true` のゲートは外せない。それ以外は、区分 `skip_kind`・理由 `skip_reason`・承認した人 `skip_approved_by` を書く。一時的な免除 `waiver` には期限 `skip_until` が必須）
+- 品質基盤（ゲートの定義、検査ツール、hook、CI、行動規約）を変える必要が出たとき
 
 ## コマンド
 
@@ -61,6 +64,7 @@ python3 tools/tracekit.py check                  # 台帳・コード・テス�
 python3 tools/tracekit.py impact --components COMP-X     # 変更前: 影響範囲と実行すべきテスト
 python3 tools/tracekit.py impact --base HEAD             # 変更後: 差分から影響範囲を抽出
 python3 tools/tracekit.py change new --title "…" --kind fix --components COMP-X --requirements REQ-001
+python3 tools/tracekit.py change new --title "…" --kind chore --quality-base trace/gates.toml --approved-by 承認した人   # 品質基盤を変えるとき
 python3 tools/tracekit.py change close CHG-001   # 全ゲートを実行し、通れば完了にする
 python3 tools/tracekit.py matrix --write         # マトリクスを作り直す
 python3 tools/verify.py                          # 品質ゲートを一括実行
@@ -69,6 +73,6 @@ python3 tools/verify.py                          # 品質ゲートを一括実�
 ## 報告のしかた
 
 - 実行していないテストを「実行した」と書かない。確かめていないことを「確認済み」と書かない。
-- `verify.py` の結果は、SKIP と UNSET も含めてそのまま伝える。
+- `verify.py` の結果は、SKIP と UNSET も含めてそのまま伝える。SKIP は合格ではなく、「承認つきで検証を外している」と伝える。
 - 基準を満たせなかったときは、満たせなかった点・理由・残るリスク・解決案を書く。満たしたことにしない。
 - 完了報告には、対応する要件ID、変更したコンポーネント、設計上の判断と理由、追加・変更したテスト、ゲートの結果、残るリスクを含める。

@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 quality-report.json
+# 配布用の ZIP（tools/make_dist.py が作る）
+dist/
+# Claude Code の作業用 worktree
+.claude/worktrees/

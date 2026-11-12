@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -57,6 +58,10 @@ class ShopCase(unittest.TestCase):
         path = tracekit.change_new(self.project(), "テスト用の変更", kind,
                                    list(components), list(requirements))
         return path, tracekit.split_frontmatter(path.read_text(encoding="utf-8"))[0]["id"]
+
+    def approved_change(self, *paths, approved_by="山田"):
+        return tracekit.change_new(self.project(), "品質基盤の見直し", "chore", [], [],
+                                   quality_base=list(paths), approved_by=approved_by)
 
     def fill(self, path):
         text = path.read_text(encoding="utf-8")
@@ -214,6 +219,16 @@ class CheckTest(ShopCase):
         self.assertIn("LEVEL-NOT-RUN", self.codes("warning", matrix=False))
 
 
+    def test_change_record_that_lists_quality_base_without_an_approver_is_an_error(self):
+        self.write("docs/changes/CHG-002.md",
+                   "---\nid: CHG-002\ntitle: ゲートの見直し\nstatus: active\nkind: chore\n"
+                   "requirements: []\ncomponents: []\nquality_base: [trace/gates.toml]\n---\n")
+        self.assertEqual(self.codes(matrix=False), ["CHG-NO-APPROVER"])
+        self.replace("docs/changes/CHG-002.md", "quality_base: [trace/gates.toml]\n",
+                     "quality_base: [trace/gates.toml]\napproved_by: 山田\n")
+        self.assertEqual(self.codes(matrix=False), [])
+
+
 class GlobTest(unittest.TestCase):
     def test_double_star_spans_directories_and_single_star_does_not(self):
         self.assertTrue(tracekit.glob_to_re("src/order/**").match("src/order/a/b.py"))
@@ -249,8 +264,37 @@ class ImpactTest(ShopCase):
         impact = tracekit.compute_impact(self.project(), files=[
             "src/billing/invoice.py", "docs/requirements/REQ-002.md", "tests/unit/test_stock.py"])
         self.assertEqual(impact["unowned_files"], ["src/billing/invoice.py"])
-        self.assertEqual(impact["direct_requirements"], ["REQ-002"])
+        # 要件を変えると、その要件を担うコンポーネントが起点になる。同じコンポーネントが担う REQ-001 も関係する
+        self.assertEqual(impact["direct_components"], ["COMP-INVENTORY", "COMP-ORDER"])
+        self.assertEqual(impact["direct_requirements"], ["REQ-001", "REQ-002"])
         self.assertIn("tests/unit/test_stock.py", impact["tests_direct"])
+
+    def test_requirement_as_the_starting_point_reaches_the_components_that_carry_it(self):
+        impact = tracekit.compute_impact(self.project(), requirements=["REQ-001"])
+        self.assertEqual(impact["direct_components"], ["COMP-INVENTORY", "COMP-ORDER"])
+        self.assertEqual(impact["via_requirements"],
+                         {"COMP-INVENTORY": ["REQ-001"], "COMP-ORDER": ["REQ-001"]})
+        self.assertEqual(impact["tests_direct"],
+                         ["tests/integration/test_order_flow.py", "tests/unit/test_stock.py"])
+        text = tracekit.render_impact(self.project(), impact)
+        self.assertIn("COMP-ORDER 注文管理", text)
+        self.assertIn("REQ-001 を担う", text)
+
+    def test_requirement_as_the_starting_point_reaches_dependents_and_their_requirements(self):
+        self.replace("docs/requirements/REQ-001.md",
+                     "components: [COMP-ORDER, COMP-INVENTORY]", "components: [COMP-INVENTORY]")
+        self.replace("docs/requirements/REQ-002.md",
+                     "components: [COMP-ORDER, COMP-INVENTORY]", "components: [COMP-ORDER]")
+        impact = tracekit.compute_impact(self.project(), requirements=["REQ-001"])
+        self.assertEqual(impact["direct_components"], ["COMP-INVENTORY"])
+        self.assertEqual(impact["dependent_components"], {"COMP-ORDER": 1})
+        self.assertEqual(impact["direct_requirements"], ["REQ-001"])
+        self.assertEqual(impact["indirect_requirements"], ["REQ-002"])
+
+    def test_quality_base_files_in_the_change_are_called_out(self):
+        impact = tracekit.compute_impact(self.project(), files=["trace/gates.toml", "README.md"])
+        self.assertEqual(impact["quality_base_files"], ["trace/gates.toml"])
+        self.assertIn("品質基盤", tracekit.render_impact(self.project(), impact))
 
 
 class GuardTest(ShopCase):
@@ -274,9 +318,8 @@ class GuardTest(ShopCase):
         self.replace("docs/requirements/REQ-002.md", "status: draft", "status: approved")
         self.assertEqual(tracekit.guard(self.project(), ["src/order/service.py"]), [])
 
-    def test_tests_docs_and_ledger_are_never_blocked(self):
-        files = ["tests/unit/test_stock.py", "docs/requirements/REQ-001.md",
-                 "trace/components.toml", "README.md"]
+    def test_tests_and_docs_are_never_blocked(self):
+        files = ["tests/unit/test_stock.py", "docs/requirements/REQ-001.md", "README.md"]
         self.assertEqual(tracekit.guard(self.project(), files), [])
 
 
@@ -302,6 +345,38 @@ class GuardTest(ShopCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("CHG-002", problems[0][1])
         self.assertEqual(tracekit.guard(self.project(), files, diff_files=files + [rel], strict=True), [])
+
+
+    def test_quality_base_change_needs_a_change_record_that_names_who_approved_it(self):
+        base = ["trace/gates.toml", "trace/config.toml", "trace/components.toml", "tools/verify.py", "tools/tests/test_tracekit.py",
+                "tools/git-hooks/pre-commit", ".github/workflows/quality.yml", ".claude/hooks/pre_edit.py",
+                ".claude/settings.json", ".claude/skills/develop/SKILL.md", "AGENTS.md", "CLAUDE.md"]
+        self.assertEqual([f for f, _ in tracekit.guard(self.project(), base)], base)
+        self.assertIn("承認", tracekit.guard(self.project(), base)[0][1])
+        self.new_change(components=["COMP-ORDER"])  # 承認の記録がない変更記録では通らない
+        self.assertEqual([f for f, _ in tracekit.guard(self.project(), base)], base)
+        self.approved_change("trace/gates.toml", "tools/**")
+        self.assertEqual([f for f, _ in tracekit.guard(self.project(), base)],
+                         ["trace/config.toml", "trace/components.toml",
+                          ".github/workflows/quality.yml", ".claude/hooks/pre_edit.py",
+                          ".claude/settings.json", ".claude/skills/develop/SKILL.md", "AGENTS.md", "CLAUDE.md"])
+
+    def test_quality_base_cannot_be_approved_by_nobody(self):
+        with self.assertRaises(tracekit.ConfigError):
+            self.approved_change("trace/gates.toml", approved_by=" ")
+
+    def test_projects_may_add_their_own_quality_base_but_cannot_remove_the_built_in_one(self):
+        self.assertEqual(tracekit.guard(self.project(), ["ruff.toml"]), [])
+        self.replace("trace/config.toml", 'source_roots = ["src"]',
+                     'source_roots = ["src"]\nquality_base = ["ruff.toml"]')
+        self.assertEqual([f for f, _ in tracekit.guard(self.project(), ["ruff.toml", "trace/gates.toml"])],
+                         ["ruff.toml", "trace/gates.toml"])
+
+    def test_outside_git_quality_base_is_not_guarded_until_the_first_component_is_declared(self):
+        # 導入の途中（ゲートや置き場所を設定している段階）まで承認の記録を求めると、導入そのものが進まない。
+        # git の管理下では、手元の台帳ではなく、コミット済みの台帳で判定する（GitDiffTest）
+        self.write("trace/components.toml", "")
+        self.assertEqual(tracekit.guard(self.project(), ["trace/gates.toml", "tools/verify.py"]), [])
 
 
 class ChangeLifecycleTest(ShopCase):
@@ -355,6 +430,70 @@ class VerifyTest(ShopCase):
         self.assertFalse(ok)
         self.assertEqual(results[-1]["status"], "FAIL")
 
+
+    def test_skip_needs_the_name_of_who_approved_it(self):
+        self.append("trace/gates.toml", '\n[[gate]]\nid = "x"\nname = "外したい"\nskip_reason = "時間がない"\n')
+        results, ok = verify.run_gates(self.root, echo=lambda _: None)
+        self.assertFalse(ok)
+        self.assertEqual(results[-1]["status"], "FAIL")
+        self.assertIn("skip_approved_by", results[-1]["detail"])
+
+    def test_skip_expires_at_its_deadline(self):
+        self.append("trace/gates.toml", '\n[[gate]]\nid = "x"\nname = "一時的に外す"\nskip_reason = "道具の移行中"\n'
+                    'skip_kind = "waiver"\nskip_approved_by = "山田"\nskip_until = "2999-12-31"\n')
+        results, ok = verify.run_gates(self.root, echo=lambda _: None)
+        self.assertTrue(ok)
+        self.assertEqual(results[-1]["status"], "SKIP")
+        self.assertIn("山田", results[-1]["detail"])
+        self.assertIn("2999-12-31", results[-1]["detail"])
+        self.replace("trace/gates.toml", 'skip_until = "2999-12-31"', "skip_until = 2020-01-31")  # TOML の日付でも書ける
+        results, ok = verify.run_gates(self.root, echo=lambda _: None)
+        self.assertFalse(ok)
+        self.assertEqual(results[-1]["status"], "FAIL")
+        self.assertIn("期限", results[-1]["detail"])
+
+    def test_deadline_that_is_not_a_date_is_a_configuration_error(self):
+        self.append("trace/gates.toml", '\n[[gate]]\nid = "x"\nname = "x"\nskip_reason = "r"\n'
+                    'skip_kind = "waiver"\nskip_approved_by = "山田"\nskip_until = "来月"\n')
+        results, ok = verify.run_gates(self.root, echo=lambda _: None)
+        self.assertFalse(ok)
+        self.assertEqual(results[-1]["id"], "gates")
+
+    def gate_x(self, body):
+        self.append("trace/gates.toml", f'\n[[gate]]\nid = "x"\nname = "x"\n{body}')
+        results, ok = verify.run_gates(self.root, echo=lambda _: None)
+        return results[-1]["status"], results[-1]["detail"], ok
+
+    def test_required_gate_cannot_be_skipped_whoever_approves(self):
+        status, detail, ok = self.gate_x('required = true\nskip_reason = "時間がない"\nskip_kind = "waiver"\n'
+                                         'skip_approved_by = "山田"\nskip_until = "2999-12-31"\n')
+        self.assertEqual((status, ok), ("FAIL", False))
+        self.assertIn("required", detail)
+
+    def test_skip_must_say_whether_there_is_nothing_to_verify_or_it_is_a_temporary_waiver(self):
+        status, detail, _ = self.gate_x('skip_reason = "r"\nskip_approved_by = "山田"\n')
+        self.assertEqual(status, "FAIL")
+        self.assertIn("skip_kind", detail)
+
+    def test_temporary_waiver_needs_a_deadline(self):
+        status, detail, _ = self.gate_x('skip_reason = "道具の移行中"\nskip_kind = "waiver"\nskip_approved_by = "山田"\n')
+        self.assertEqual(status, "FAIL")
+        self.assertIn("skip_until", detail)
+
+    def test_gate_with_nothing_to_verify_needs_no_deadline(self):
+        status, detail, ok = self.gate_x('skip_reason = "画面がない"\nskip_kind = "not_applicable"\n'
+                                         'skip_approved_by = "山田"\n')
+        self.assertEqual((status, ok), ("SKIP", True))
+        self.assertIn("対象なし", detail)
+
+    def test_skipped_gates_are_reported_as_not_verified(self):
+        report = self.root / "out" / "gates.json"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(verify.main(["--root", str(self.root), "--report", str(report)]), 0)
+        self.assertIn("検証していません", out.getvalue().splitlines()[-1])
+        data = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(data["unverified"], ["types", "architecture", "e2e"])
 
     def test_report_file_records_every_gate(self):
         report = self.root / "out" / "gates.json"
@@ -421,7 +560,7 @@ class HookTest(ShopCase):
         self.assertEqual(self.run_hook("pre_edit.py", self.edit("src/inventory/stock.py")).returncode, 2)
 
     def test_pre_edit_allows_tests_docs_and_files_outside_project(self):
-        for rel in ("tests/unit/test_stock.py", "docs/requirements/REQ-009.md", "trace/components.toml"):
+        for rel in ("tests/unit/test_stock.py", "docs/requirements/REQ-009.md", "docs/architecture.md"):
             self.assertEqual(self.run_hook("pre_edit.py", self.edit(rel)).returncode, 0, rel)
         outside = {"tool_name": "Write", "cwd": str(self.root), "tool_input": {"file_path": "/tmp/x.py"}}
         self.assertEqual(self.run_hook("pre_edit.py", outside).returncode, 0)
@@ -430,6 +569,25 @@ class HookTest(ShopCase):
         self.write("trace/components.toml", "[[component]\n")
         self.assertEqual(self.run_hook("pre_edit.py", self.edit("src/order/service.py")).returncode, 2)
         self.assertEqual(self.run_hook("pre_edit.py", self.edit("trace/components.toml")).returncode, 0)
+        # 台帳を壊しておけば、検査ツールやゲートを自由に書き換えられる、という抜け道にしない
+        self.assertEqual(self.run_hook("pre_edit.py", self.edit("trace/gates.toml")).returncode, 2)
+        self.assertEqual(self.run_hook("pre_edit.py", self.edit("tools/verify.py")).returncode, 2)
+
+    def test_hooks_answer_a_probe_so_that_doctor_can_tell_they_are_really_called(self):
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.root), TRACEKIT_PROBE="1")
+        for name, code in (("pre_edit.py", 2), ("on_stop.py", 0), ("session_start.py", 0)):
+            done = subprocess.run([sys.executable, str(HOOKS / name)], input="{}", capture_output=True,
+                                  text=True, env=env)
+            self.assertEqual(done.returncode, code, name)
+            self.assertIn(tracekit.PROBE_MARK, done.stdout + done.stderr, name)
+
+    def test_pre_edit_blocks_quality_base_until_an_approved_change_record_covers_it(self):
+        done = self.run_hook("pre_edit.py", self.edit("trace/gates.toml"))
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("承認", done.stderr)
+        self.approved_change("trace/gates.toml")
+        self.assertEqual(self.run_hook("pre_edit.py", self.edit("trace/gates.toml")).returncode, 0)
+        self.assertEqual(self.run_hook("pre_edit.py", self.edit("tools/verify.py")).returncode, 2)
 
     def test_stop_blocks_once_when_ledger_is_inconsistent(self):
         self.write("tests/unit/test_extra.py", '"""REQ-999"""\n')
@@ -552,8 +710,143 @@ class GitDiffTest(ShopCase):
                               capture_output=True, text=True, env=env, encoding="utf-8")
         self.assertEqual(done.returncode, 0, done.stderr)  # 完了済みでも、同じ未コミットの差分にあれば有効
 
-    def doctor(self):
-        return {item: state for state, item, _ in tracekit.doctor(self.root)}
+    def test_weakening_a_gate_is_stopped_until_a_person_approves_it(self):
+        # レビューで指摘された抜け道: テストのゲートを、何も確かめないコマンドに差し替える
+        self.replace("trace/gates.toml",
+                     'cmd = "PYTHONPATH=src python3 -m unittest discover -s tests/unit -q"', 'cmd = "true"')
+        self.assertEqual(self.cli("guard", "--base", "HEAD"), 1)
+        self.assertEqual(self.cli("guard", "--base", "HEAD", "--strict"), 1)
+        self.git("add", "-A")
+        self.assertEqual(self.cli("guard", "--staged"), 1)
+        self.approved_change("trace/gates.toml")
+        self.git("add", "-A")
+        self.assertEqual(self.cli("guard", "--staged"), 0)
+        self.assertEqual(self.cli("guard", "--base", "HEAD", "--strict"), 0)
+
+    def test_approval_left_open_does_not_cover_a_later_pull_request(self):
+        self.approved_change("trace/gates.toml")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "承認つきの変更記録を閉じ忘れた")
+        self.append("trace/gates.toml", "\n# 別の変更\n")
+        self.assertEqual(self.cli("guard", "--base", "HEAD", "--strict"), 1)
+
+    def test_stop_hook_reports_quality_base_change_made_outside_the_edit_tools(self):
+        self.append("trace/gates.toml", "\n# シェルから書き換えた\n")
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.root))
+        payload = json.dumps({"hook_event_name": "Stop", "stop_hook_active": False})
+        done = subprocess.run([sys.executable, str(HOOKS / "on_stop.py")], input=payload,
+                              capture_output=True, text=True, env=env, encoding="utf-8")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("trace/gates.toml", done.stderr)
+
+    def test_emptying_the_component_ledger_does_not_switch_the_guard_off(self):
+        # 再レビューで指摘された抜け道: 保護が働く条件（コンポーネントがある）を、変更する側の台帳で満たさなくする
+        self.write("trace/components.toml", "")
+        self.replace("trace/gates.toml",
+                     'cmd = "PYTHONPATH=src python3 -m unittest discover -s tests/unit -q"', 'cmd = "true"')
+        self.assertEqual(self.project().components, {})
+        blocked = [f for f, _ in tracekit.guard(self.project(), ["trace/gates.toml"])]  # 編集の時点（hook）
+        self.assertEqual(blocked, ["trace/gates.toml"])
+        self.assertEqual(self.cli("guard", "--base", "HEAD", "--strict"), 1)
+        self.git("add", "-A")
+        self.assertEqual(self.cli("guard", "--staged"), 1)
+
+    def test_guard_starts_once_a_ledger_with_components_is_committed(self):
+        original = (self.root / "trace/components.toml").read_text(encoding="utf-8")
+        self.write("trace/components.toml", "")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "導入の途中。コンポーネントはまだない")
+        self.write("trace/components.toml", original)  # 最初の宣言と、ゲートの設定。まだ承認の記録は求めない
+        self.append("trace/gates.toml", "\n# 設定の調整\n")
+        self.assertEqual(self.cli("guard", "--base", "HEAD", "--strict"), 0)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "コンポーネントを宣言した")
+        self.append("trace/gates.toml", "\n# 導入のあとの変更\n")
+        self.assertEqual(self.cli("guard", "--base", "HEAD", "--strict"), 1)
+
+    def test_changing_the_component_ledger_needs_approval_like_any_other_quality_base(self):
+        self.replace("trace/components.toml", "depends_on = []", 'depends_on = ["COMP-ORDER"]')
+        self.assertEqual(self.cli("guard", "--base", "HEAD"), 1)
+        self.approved_change("trace/components.toml")
+        self.assertEqual(self.cli("guard", "--base", "HEAD"), 0)
+
+    def doctor(self, **kwargs):
+        return {item: state for state, item, _ in tracekit.doctor(self.root, **kwargs)}
+
+    def install_tools(self):
+        # hook は、プロジェクトの tools/ にある検査ツールを読み込む
+        for name in ("tracekit.py", "verify.py"):
+            (self.root / "tools").mkdir(exist_ok=True)
+            shutil.copy(REPO / "tools" / name, self.root / "tools" / name)
+
+    def install_hooks(self):
+        self.install_tools()
+        shutil.copytree(REPO / ".claude" / "hooks", self.root / ".claude" / "hooks",
+                        ignore=shutil.ignore_patterns("__pycache__"), dirs_exist_ok=True)
+
+    def settings(self, text):
+        self.install_hooks()
+        self.write(".claude/settings.json", text)
+        return self.doctor()["Claude Code の hook"]
+
+    @unittest.skipIf(os.name == "nt", "hook を実際に呼ぶ確認は、Windows では行わない")
+    def test_doctor_calls_each_hook_and_is_not_fooled_by_a_command_that_only_names_it(self):
+        good = (REPO / ".claude" / "settings.json").read_text(encoding="utf-8")
+        self.assertEqual(self.settings(good), "OK")
+        fake = good.replace('python3 \\"$CLAUDE_PROJECT_DIR/.claude/hooks/pre_edit.py\\"', "echo pre_edit.py")
+        self.assertNotEqual(fake, good)
+        self.assertEqual(self.settings(fake), "WARN")
+        shutil.rmtree(self.root / ".claude" / "hooks")  # 設定は正しいが、hook の本体がない
+        self.write(".claude/settings.json", good)
+        self.assertEqual(self.doctor()["Claude Code の hook"], "WARN")
+
+    @unittest.skipIf(os.name == "nt", "実行権限は Windows では見ない")
+    def test_doctor_flags_a_commit_hook_that_lost_its_executable_bit(self):
+        shutil.copytree(REPO / "tools" / "git-hooks", self.root / "tools" / "git-hooks")
+        self.git("config", "core.hooksPath", "tools/git-hooks")
+        hook = self.root / "tools" / "git-hooks" / "pre-commit"
+        hook.chmod(0o644)  # ZIP の展開やコピーで落ちた状態
+        self.assertEqual(self.doctor()["コミット前の検査の実行権限"], "NG")
+        hook.chmod(0o755)
+        self.assertEqual(self.doctor()["コミット前の検査の実行権限"], "OK")
+
+    def test_doctor_for_ci_checks_what_can_be_checked_there(self):
+        local = self.doctor()
+        ci = self.doctor(ci=True)
+        self.assertEqual(local["コミット前の検査"], "NG")  # clone ごとの設定。CI の環境にはない
+        self.assertNotIn("コミット前の検査", ci)
+        self.assertNotIn("NG", ci.values())
+        self.replace("trace/config.toml", 'source_roots = ["src"]', "source_roots = []")
+        self.assertEqual(self.doctor(ci=True)["本番コードの置き場所"], "NG")
+        self.assertEqual(self.cli("doctor", "--ci"), 1)
+
+    def test_doctor_rejects_source_roots_that_cover_nothing(self):
+        self.replace("trace/config.toml", 'source_roots = ["src"]', "source_roots = []")
+        self.assertEqual(self.doctor()["本番コードの置き場所"], "NG")
+        self.replace("trace/config.toml", "source_roots = []", 'source_roots = ["lib"]')
+        (self.root / "lib").mkdir()
+        self.assertEqual(self.doctor()["本番コードの置き場所"], "WARN")  # 場所はあるが、本番コードが1件もない
+
+    def test_doctor_reads_hook_settings_instead_of_searching_for_file_names(self):
+        good = (REPO / ".claude" / "settings.json").read_text(encoding="utf-8")
+        self.assertEqual(self.settings(good), "OK")
+        self.assertEqual(self.settings(good[:-3]), "WARN")  # 壊れた JSON。名前は全部書いてあるが、働かない
+        self.assertEqual(self.settings(good.replace('"PreToolUse"', '"PostToolUse"')), "WARN")  # 編集の後では止まらない
+        self.assertEqual(self.settings(good.replace("Edit|Write|NotebookEdit", "Bash")), "WARN")  # 編集に掛かっていない
+        self.assertEqual(self.settings(good.replace("Edit|Write|NotebookEdit", "Edit")), "WARN")  # Write が抜けている
+        self.assertEqual(self.settings(good.replace('"matcher": "Edit|Write|NotebookEdit",', "")), "OK")  # すべての道具に掛かる
+
+    def test_doctor_wants_ci_to_run_both_the_guard_and_the_gates(self):
+        workflow = (REPO / ".github" / "workflows" / "quality.yml").read_text(encoding="utf-8")
+        self.write(".github/workflows/quality.yml", workflow)
+        self.assertEqual(self.doctor()["CI"], "OK")
+        self.write(".github/workflows/quality.yml", "# python3 tools/verify.py と tracekit.py guard を実行する予定\n")
+        self.assertEqual(self.doctor()["CI"], "INFO")
+        self.write(".github/workflows/quality.yml", "steps:\n  - run: python3 tools/verify.py\n")
+        self.assertEqual(self.doctor()["CI"], "INFO")  # guard がない
+        self.write(".github/workflows/quality.yml", 'steps:\n  - run: echo "python3 tools/verify.py"\n'
+                   '  - run: echo "python3 tools/tracekit.py guard --base HEAD --strict"\n')
+        self.assertEqual(self.doctor()["CI"], "INFO")  # 表示しているだけで、実行していない
 
     def test_doctor_tells_whether_each_safeguard_is_actually_enabled(self):
         before = self.doctor()
@@ -561,6 +854,9 @@ class GitDiffTest(ShopCase):
         self.assertEqual(before["Claude Code の hook"], "WARN")
         self.assertEqual(before["品質ゲートの設定"], "OK")
         shutil.copytree(REPO / "tools" / "git-hooks", self.root / "tools" / "git-hooks")
+        # 実行権限は配り方しだいで落ちる（ZIP の展開など）。ここでは付いている状態を作り、落ちた状態は別のテストで見る
+        (self.root / "tools" / "git-hooks" / "pre-commit").chmod(0o755)
+        self.install_tools()
         self.git("config", "core.hooksPath", "tools/git-hooks")
         shutil.copytree(REPO / ".claude", self.root / ".claude",
                         ignore=shutil.ignore_patterns("__pycache__", "settings.json"))
@@ -583,6 +879,29 @@ class GitDiffTest(ShopCase):
         impact = tracekit.compute_impact(self.project(),
                                          files=tracekit.git_changed(self.root, base="HEAD"))
         self.assertEqual(impact["direct_components"], ["COMP-INVENTORY"])
+
+
+class AdapterExamplesTest(unittest.TestCase):
+    def test_every_toml_example_can_be_pasted_as_it_is(self):
+        text = (REPO / "adapters" / "README.md").read_text(encoding="utf-8")
+        blocks = re.findall(r"```toml\n(.*?)```", text, re.S)
+        self.assertGreaterEqual(len(blocks), 8)
+        gate_blocks = 0
+        for block in blocks:
+            with self.subTest(block=block.splitlines()[0]):
+                data = tomllib.loads(block)
+                if "gate" not in data:
+                    continue
+                gate_blocks += 1
+                with tempfile.TemporaryDirectory() as tmp:
+                    (Path(tmp) / "trace").mkdir()
+                    (Path(tmp) / "trace" / "gates.toml").write_text(block, encoding="utf-8")
+                    for gate in tracekit.load_gates(Path(tmp)):
+                        # 例の承認者は空にしてある（貼ったまま、誰も承認していないのに通ることがないように）
+                        if gate.get("skip_reason") and not gate.get("skip_approved_by"):
+                            gate["skip_approved_by"] = "承認した人"
+                        self.assertIn(tracekit.gate_state(gate)[0], ("RUN", "SKIP"), gate["id"])
+        self.assertGreaterEqual(gate_blocks, 4)
 
 
 if __name__ == "__main__":

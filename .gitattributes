@@ -1,0 +1,4 @@
+# 配布用の ZIP（git archive）に入れないもの。テンプレートを配る人のための道具。
+tools/make_dist.py export-ignore
+tools/tests/test_make_dist.py export-ignore
+.gitattributes export-ignore

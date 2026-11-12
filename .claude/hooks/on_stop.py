@@ -5,7 +5,7 @@
 完了時（change close）・コミット前・CI が受け持つ。
 
 1. tracekit check（台帳・コード・テストの整合）
-2. まだコミットしていない本番コードの変更が、変更記録の範囲に入っているか。
+2. まだコミットしていない本番コード・品質基盤の変更が、変更記録の範囲に入っているか。
    pre_edit hook は Edit / Write しか見ないので、シェルのコマンドで書き換えた変更はここで見つける。
 
 同じ指摘で止め続けないよう、止めるのは1回だけ（stop_hook_active のときは通す）。
@@ -24,6 +24,9 @@ def main() -> int:
     import tracekit
 
     tracekit.setup_output("utf-8")
+    if os.environ.get("TRACEKIT_PROBE"):  # doctor からの呼び出し。この hook が実際に呼ばれることを示す
+        print(tracekit.PROBE_MARK, file=sys.stderr)
+        return 0
     try:
         data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
     except ValueError:
@@ -55,8 +58,9 @@ def main() -> int:
         if len(errors) > MAX_SHOWN:
             print(f"  …ほか {len(errors) - MAX_SHOWN} 件（python3 tools/tracekit.py check）", file=sys.stderr)
     if outside:
-        print(f"変更記録の範囲に入っていない本番コードの変更が {len(outside)} 件、コミットされずに残っています。"
-              "自分の変更なら影響分析をして変更記録に含め、そうでなければ利用者に報告してから終了してください:",
+        print(f"変更記録の範囲に入っていない変更（本番コード、または品質基盤）が {len(outside)} 件、"
+              "コミットされずに残っています。自分の変更なら、本番コードは影響分析をして変更記録に含め、"
+              "品質基盤は利用者の承認を得て変更記録に記録してください。そうでなければ利用者に報告してから終了してください:",
               file=sys.stderr)
         for rel, message in outside[:MAX_SHOWN]:
             print(f"  {rel}: {message}", file=sys.stderr)

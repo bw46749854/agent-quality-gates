@@ -7,8 +7,12 @@
 結果の意味:
   PASS   コマンドが終了コード 0 で終わった
   FAIL   コマンドが失敗した
-  SKIP   コマンドが空で、理由（skip_reason）が書かれている
+  SKIP   検証していない。コマンドが空で、理由（skip_reason）と承認した人（skip_approved_by）が
+         書かれていて、期限（skip_until。任意）を過ぎていない
   UNSET  コマンドも理由も空。黙って飛ばさないために、不合格として扱う
+
+SKIP は「合格」ではなく「承認つきで検証を外した」状態。全体の合否は止めないが、
+検証していないものとして、合格とは分けて表示・記録する。
 """
 from __future__ import annotations
 
@@ -66,15 +70,9 @@ def run_gates(root: Path, only: list[str] | None = None, echo=print) -> tuple[li
         gate_id, name = str(gate["id"]), str(gate.get("name", gate["id"]))
         if only and gate_id not in only:
             continue
-        cmd = str(gate.get("cmd", "")).strip()
-        reason = str(gate.get("skip_reason", "")).strip()
-        if cmd and reason:
-            record(gate_id, name, "FAIL", "cmd と skip_reason の両方が書かれています。どちらかにしてください")
-        elif not cmd and reason:
-            record(gate_id, name, "SKIP", f"実行していません。理由: {reason}")
-        elif not cmd:
-            record(gate_id, name, "UNSET",
-                   "未設定です。trace/gates.toml に cmd を書くか、実行しない理由を skip_reason に書いてください")
+        state, cmd = tracekit.gate_state(gate)
+        if state != "RUN":
+            record(gate_id, name, state, cmd)
         else:
             started = time.monotonic()
             try:
@@ -110,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         report.write_text(json.dumps({
             "ok": ok,
             "partial": bool(only),  # True: 一部のゲートだけを実行した。全体の合否ではない
+            "unverified": [r["id"] for r in results if r["status"] == "SKIP"],  # 承認つきで検証を外したゲート
             "generated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
             "commit": tracekit.git_head(root),
             "gates": results,
@@ -117,7 +116,9 @@ def main(argv: list[str] | None = None) -> int:
 
     counts = {s: sum(1 for r in results if r["status"] == s) for s in ("PASS", "FAIL", "SKIP", "UNSET")}
     summary = "、".join(f"{status} {count}" for status, count in counts.items() if count)
+    skipped = [r["id"] for r in results if r["status"] == "SKIP"]
     print(f"\n品質ゲート: {'合格' if ok else '不合格'}（{summary}）"
+          + (f"　※SKIP の {len(skipped)} 件（{', '.join(skipped)}）は検証していません" if skipped else "")
           + ("　※一部のゲートだけを実行しました" if only else ""))
     return 0 if ok else 1
 

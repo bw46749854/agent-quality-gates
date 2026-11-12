@@ -3,8 +3,18 @@
 #
 # ルール:
 # - cmd が終了コード 0 で終われば合格。
-# - cmd を空のままにする場合は、skip_reason に理由を必ず書く。
+# - required = true のゲートは、必須。理由や承認があっても外せない（cmd が空なら不合格）。
+# - それ以外のゲートを実行しない（cmd を空のままにする）のは、人が承認したときだけ。外し方は2つ。
+#     skip_kind = "not_applicable"  確かめる対象がない（画面のないライブラリの E2E など）
+#     skip_kind = "waiver"          対象はあるが、一時的に外す。期限（skip_until）が必須で、過ぎた日から不合格になる
+#   どちらも、次を書く。
+#     skip_reason      = "実行しない理由（waiver なら、外しているあいだのリスクと、どう補うかも）"
+#     skip_approved_by = "承認した人の名前"（必須。空なら不合格）
+#     skip_until       = "2027-03-31"（waiver では必須）
 #   cmd も skip_reason も空のゲートは「未設定」として不合格になる（黙って飛ばさないため）。
+#   実行しないゲートは SKIP と表示される。合格（PASS）ではなく、「検証していない」という意味。
+# - このファイルは品質基盤。コンポーネントを宣言したあとは、変えるたびに、承認した人を記録した
+#   変更記録が要る（docs/changes/README.md）。
 # - トレーサビリティ検査（tools/tracekit.py check）は、ここに書かなくても必ず最初に実行される。
 # - id がテストのレベル名（trace/config.toml の [tests] のキー）と同じゲートは、そのレベルのテストを
 #   実行するものとして扱う。1つのコマンドが複数のレベルをまとめて実行する場合は、
@@ -19,40 +29,62 @@
 id = "static"
 name = "静的解析"
 cmd = ""
+skip_kind = ""
 skip_reason = ""
+skip_approved_by = ""
+skip_until = ""
 
 [[gate]]
 id = "types"
 name = "型検査"
 cmd = ""
+skip_kind = ""
 skip_reason = ""
+skip_approved_by = ""
+skip_until = ""
 
 [[gate]]
 id = "architecture"
 name = "アーキテクチャテスト（依存ルールの厳密な検査）"
 cmd = ""
+skip_kind = ""
 skip_reason = ""
+skip_approved_by = ""
+skip_until = ""
 
 [[gate]]
 id = "unit"
 name = "単体テスト"
+required = true
 cmd = ""
+skip_kind = ""
 skip_reason = ""
+skip_approved_by = ""
+skip_until = ""
 
 [[gate]]
 id = "integration"
 name = "結合テスト"
 cmd = ""
+skip_kind = ""
 skip_reason = ""
+skip_approved_by = ""
+skip_until = ""
 
 [[gate]]
 id = "e2e"
 name = "E2Eテスト"
 cmd = ""
+skip_kind = ""
 skip_reason = ""
+skip_approved_by = ""
+skip_until = ""
 
 [[gate]]
 id = "contract"
 name = "契約テスト"
 cmd = ""
+skip_kind = ""
 skip_reason = ""
+skip_approved_by = ""
+skip_until = ""

@@ -1,5 +1,8 @@
 # 品質ゲート。手元の hook を通らなかった変更（別のエージェント、手作業、シェル経由の編集）もここで止める。
 # GitHub Actions 以外の CI を使う場合も、実行する内容は下の3つのコマンドと同じ。
+#
+# この定義があるだけでは、失敗したプルリクエストも取り込めてしまう。リポジトリの設定（ブランチの保護）で、
+# このジョブの成功と、コードオーナーのレビューを必須にすること（README「チームで使うとき」）。
 name: quality
 
 on:
@@ -27,9 +30,24 @@ jobs:
 
       # --strict: 進行中（active）の変更記録も、このプルリクエストで追加・更新されたものだけを有効とみなす。
       # 閉じ忘れた変更記録が、あとの無関係な変更まで通してしまうのを防ぐ。
-      - name: 変更が影響分析済みの範囲に入っているか
+      # 番人は、取り込み先のブランチにある検査ツールで動かす。このプルリクエストが検査ツールを書き換えていても、
+      # 書き換える前の規則で調べるため（取り込み先にまだ検査ツールがない、最初の導入のときだけ、手元のものを使う）。
+      - name: 変更が影響分析済みの範囲に入っているか（品質基盤の変更は、承認の記録があるか）
         if: github.event_name == 'pull_request'
-        run: python3 tools/tracekit.py guard --base "origin/${{ github.base_ref }}" --strict
+        run: |
+          base="origin/${{ github.base_ref }}"
+          tool="tools/tracekit.py"
+          if git cat-file -e "$base:tools/tracekit.py" 2>/dev/null; then
+            mkdir -p "$RUNNER_TEMP/base-tools"
+            git show "$base:tools/tracekit.py" > "$RUNNER_TEMP/base-tools/tracekit.py"
+            tool="$RUNNER_TEMP/base-tools/tracekit.py"
+          fi
+          python3 "$tool" --root . guard --base "$base" --strict
+
+      # 仕組みが働く状態か。本番コードの置き場所が空、コンポーネントがない、ゲートが未設定、といった
+      # 「検査の対象を減らして通す」状態をここで止める（clone ごとの設定であるコミット前の検査は調べない）。
+      - name: 導入の確認
+        run: python3 tools/tracekit.py doctor --ci
 
       - name: 品質ゲート
         run: python3 tools/verify.py --report quality-report.json

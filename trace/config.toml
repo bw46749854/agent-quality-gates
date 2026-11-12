@@ -7,6 +7,12 @@ source_roots = ["src"]
 # 検査の対象から外すパス（生成物、サンプルなど）。
 ignore = ["examples/**"]
 
+# 品質基盤に足すパス（リンターや型検査の設定、ほかの CI の定義など）。変えるには、承認した人を記録した変更記録が要る。
+# trace/gates.toml・trace/config.toml・tools/ の検査ツール・.github/workflows/・.claude/ の hook と skill・AGENTS.md は、
+# ここに書かなくても最初から含まれていて、外すことはできない。
+# 例: quality_base = ["ruff.toml", "mypy.ini", ".gitlab-ci.yml"]
+quality_base = []
+
 requirements_dir = "docs/requirements"
 changes_dir = "docs/changes"
 matrix_file = "docs/traceability.md"

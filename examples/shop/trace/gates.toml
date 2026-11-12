@@ -1,25 +1,31 @@
 [[gate]]
 id = "static"
-name = "静的解析"
+name = "構文の検査（compileall。実プロジェクトでは ruff などの静的解析を設定する）"
 cmd = "python3 -m compileall -q src tests"
 
 [[gate]]
 id = "types"
 name = "型検査"
-skip_reason = "サンプルを標準ライブラリだけで動かすため。実プロジェクトでは mypy などを設定する"
+skip_reason = "サンプルは標準ライブラリだけで動かす方針で、型検査の道具を入れていない。実プロジェクトでは mypy などを設定する"
+skip_kind = "not_applicable"
+skip_approved_by = "テンプレートの作者（サンプルのため）"
 
 [[gate]]
 id = "architecture"
 name = "アーキテクチャテスト"
 skip_reason = "依存ルールは tracekit の reference_patterns による検査で確認している"
+skip_kind = "not_applicable"
+skip_approved_by = "テンプレートの作者（サンプルのため）"
 
 [[gate]]
 id = "unit"
+required = true
 name = "単体テスト"
 cmd = "PYTHONPATH=src python3 -m unittest discover -s tests/unit -q"
 
 [[gate]]
 id = "integration"
+required = true
 name = "結合テスト"
 cmd = "PYTHONPATH=src python3 -m unittest discover -s tests/integration -q"
 
@@ -27,3 +33,5 @@ cmd = "PYTHONPATH=src python3 -m unittest discover -s tests/integration -q"
 id = "e2e"
 name = "E2Eテスト"
 skip_reason = "画面も外部公開のAPIもないライブラリのため、結合テストが最上位の検証になる"
+skip_kind = "not_applicable"
+skip_approved_by = "テンプレートの作者（サンプルのため）"

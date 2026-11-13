@@ -942,6 +942,19 @@ class RegressTest(GitCase):
         self.assertFalse(ok)
         self.assertEqual({r["id"]: r["status"] for r in results}["regress"], "FAIL")
 
+    def test_project_in_a_subdirectory_of_the_repository_is_compared_too(self):
+        sub = self.root / "services" / "app"
+        shutil.copytree(EXAMPLE, sub, ignore=shutil.ignore_patterns("__pycache__"))
+        self.land_on_main()
+        project = tracekit.Project(sub)
+        (sub / "tests/unit/test_stock.py").unlink()
+        with tracekit.snapshot(sub, tracekit.base_revision(project)) as base:
+            self.assertIsNotNone(base)
+            self.assertIn("tests/unit/test_stock.py", base.test_files)
+            report = tracekit.regress(tracekit.Project(sub), base)
+        self.assertTrue(report["compared"])
+        self.assertIn("tests/unit/test_stock.py", [i["id"] for i in report["items"] if i["blocks"]])
+
     def test_doctor_tells_when_the_branch_to_compare_with_is_missing(self):
         state = {item: s for s, item, _ in tracekit.doctor(self.root)}
         self.assertEqual(state["比較の基準"], "OK")

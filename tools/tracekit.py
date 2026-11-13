@@ -1147,8 +1147,10 @@ def snapshot(root: Path, rev: str | None):
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
         try:
             tree = _git(root, "rev-parse", "--verify", "-q", f"{rev}:./").strip()
+            # 取り出しは、リポジトリの最上位から行う（下のフォルダから行うと、何も取り出されない）
+            top = _git(root, "rev-parse", "--show-toplevel").strip()
             for args in (("read-tree", tree), ("checkout-index", "-a", "--prefix=" + target + os.sep)):
-                subprocess.run(["git", "-C", str(root), *args], env=env, check=True, capture_output=True)
+                subprocess.run(["git", "-C", top, *args], env=env, check=True, capture_output=True)
             base = Project(target)
         except (OSError, subprocess.CalledProcessError, ConfigError):
             base = None  # 変更する前の台帳がない・読めない。比べられない

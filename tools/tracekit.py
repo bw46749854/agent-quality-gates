@@ -54,7 +54,7 @@ CHG_KEYS = {"id", "title", "status", "kind", "requirements", "components",
 COMP_KEYS = {"id", "name", "responsibility", "paths", "depends_on",
              "reference_patterns", "status", "shared"}
 CHG_REQUIRED_SECTIONS = ("目的", "変更内容", "台帳に現れない影響の調査",
-                         "回帰テスト計画", "不確実な点・残るリスク")
+                         "回帰テスト計画", "レビュー", "不確実な点・残るリスク")
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
              "target", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
 MAX_SCAN_BYTES = 2_000_000
@@ -1572,6 +1572,9 @@ components: [{components}]
 
 ## 回帰テスト計画
 <!-- 上の「実行すべきテスト」に加えて、新しく追加・修正するテストを書く。 -->
+
+## レビュー
+<!-- design-reviewer・test-reviewer に頼んだ結果（判定と、指摘への対応）。頼めなかった・頼まなかったなら、その理由と、代わりに誰が何を見るか。 -->
 
 ## 不確実な点・残るリスク
 <!-- 影響を特定しきれなかった点。なければ「なし」と書く。 -->

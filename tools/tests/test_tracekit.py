@@ -960,7 +960,55 @@ class RegressTest(GitCase):
         self.assertEqual(state["比較の基準"], "OK")
         self.replace("trace/config.toml", 'source_roots = ["src"]', 'source_roots = ["src"]\nbase_branch = "trunk"')
         state = {item: s for s, item, _ in tracekit.doctor(self.root)}
-        self.assertEqual(state["比較の基準"], "WARN")
+        self.assertEqual(state["比較の基準"], "NG")
+
+    def test_losing_the_branch_to_compare_with_is_a_failure_not_a_pass(self):
+        # 第4回のレビューで通ってしまった操作: 記録を消してコミットし、比較の基準のブランチを別名にする
+        (self.root / "docs/changes/CHG-001.md").unlink()
+        self.commit("完了済みの変更記録を消した")
+        self.git("branch", "-m", "main", "old-main")
+        self.assertIsNone(tracekit.base_revision(self.project()))
+        code, text = self.cli_text("regress")
+        self.assertEqual(code, 1)
+        self.assertIn("main", text)
+        results, ok = verify.run_gates(self.root, echo=lambda _: None)
+        self.assertFalse(ok)
+        self.assertEqual({r["id"]: r["status"] for r in results}["regress"], "FAIL")
+
+    def test_missing_branch_is_fine_while_the_project_is_still_being_introduced(self):
+        self.write("trace/components.toml", "")
+        self.commit("導入の途中")
+        self.git("branch", "-D", "main")
+        self.assertEqual(self.cli("regress"), 0)
+
+    def test_dropping_a_required_test_level_needs_acceptance(self):
+        # 実装済みの要件から検証レベルを外すと、そのレベルのテストがなくても検査を通るようになる
+        self.replace("docs/requirements/REQ-001.md", "verify: [unit, integration]", "verify: [unit]")
+        self.assertEqual(self.unaccepted(), ["REQ-001/verify:integration"])
+        self.accepting_change("REQ-001/verify:integration", requirements=["REQ-001"])
+        self.assertEqual(self.unaccepted(), [])
+
+    def test_changed_test_helper_is_reported(self):
+        # テストの代用品や共通の準備は、テストファイルではないので、どの要件にも結びつかない。弱めても気づけるようにする
+        self.write("tests/integration/helpers.py", "def store():\n    return {'A': 10}\n")
+        self.land_on_main()
+        self.write("tests/integration/helpers.py", "def store():\n    return None\n")
+        report = self.report()
+        self.assertEqual([i for i in report["items"] if i["blocks"]], [])
+        self.assertIn("tests/integration/helpers.py", "\n".join(report["notes"]))
+        self.write("tests/integration/other_helpers.py", "X = 1\n")  # 足すだけなら報告しない
+        self.assertNotIn("other_helpers", "\n".join(self.report()["notes"]))
+
+    def test_rewording_an_acceptance_criterion_is_reported_for_review(self):
+        self.new_change(components=["COMP-ORDER"], requirements=["REQ-001"])
+        self.replace("docs/requirements/REQ-001.md", "THEN 注文は拒否され、在庫数は変わらない",
+                     "THEN 注文が成立し、在庫数は変わらない")
+        report = self.report()
+        self.assertEqual([i for i in report["items"] if i["blocks"]], [])
+        notes = "\n".join(report["notes"])
+        self.assertIn("REQ-001/AC-2", notes)
+        self.assertIn("注文が成立し", notes)
+        self.assertIn("注文は拒否され", notes)
 
 
 @unittest.skipUnless(shutil.which("git"), "git がありません")

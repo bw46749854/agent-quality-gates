@@ -64,14 +64,18 @@ def run_gates(root: Path, only: list[str] | None = None, echo=print) -> tuple[li
             record("trace", "トレーサビリティ検査", "FAIL", "台帳を読めません", str(exc))
 
     # 変更する前（基準のブランチとの分かれ目）と比べる。いまの台帳が整合していても、要件やテストを消した結果かもしれない。
-    # git の外や、導入の途中（変更する前にコンポーネントがない）では比べられないので、記録しない（doctor が知らせる）
+    # git の外や、導入の途中（変更する前にコンポーネントがない）では比べられないので、記録しない（doctor が知らせる）。
+    # 導入が済んでいるのに比べる相手（基準のブランチ）がないときは、不合格にする
     if not only or "regress" in only:
         try:
             project = project or tracekit.Project(root)
             base_name = str(project.cfg["base_branch"])
             with tracekit.snapshot(root, tracekit.base_revision(project)) as base:
                 report = tracekit.regress(project, base)
-            if report["compared"]:
+            if report["broken"]:
+                record("regress", f"後退の検出（{base_name} との比較）", "FAIL", "比べられません",
+                       report["reason"])
+            elif report["compared"]:
                 blocking = sum(1 for item in report["items"] if item["blocks"])
                 record("regress", f"後退の検出（{base_name} との比較）", "FAIL" if blocking else "PASS",
                        f"承認されていない後退 {blocking} 件、承認済み {len(report['items']) - blocking} 件、"

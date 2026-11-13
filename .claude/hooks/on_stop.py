@@ -49,23 +49,29 @@ def main(data: dict) -> int:
         print(f"台帳を読めません。直してから終了してください: {exc}", file=sys.stderr)
         return 2
     errors = [f for f in findings if f.level == "error"]
-    outside, lost, notes = [], [], []
-    rev = tracekit.base_revision(project)
-    if rev is not None:  # git の外、最初のコミットの前では比べられない。コミット前の検査に任せる
-        try:
-            changed = tracekit.git_changed(root, base=rev)
-            with tracekit.snapshot(root, rev) as base:
-                # 要件の変更は、変更記録を作る前の工程で行うことがあるので、ここでは見ない（コミット前に見る）
-                outside = tracekit.guard(project, changed, diff_files=changed, check_requirements=False,
-                                         base_rev=rev, base=base)
-                report = tracekit.regress(project, base)
-            lost = [item for item in report["items"] if item["blocks"]]
-            notes = report["notes"]
-        except tracekit.ConfigError:
-            pass
+    outside, lost, notes, approvals = [], [], [], []
+    rev = tracekit.base_revision(project)  # 基準のブランチがなければ None（直前のコミットとだけ比べる）
+    try:
+        changed = tracekit.git_changed(root, base=rev)
+        with tracekit.snapshot(root, rev) as base:
+            # 要件の変更は、変更記録を作る前の工程で行うことがあるので、ここでは見ない（コミット前に見る）
+            outside = tracekit.guard(project, changed, diff_files=changed, check_requirements=False,
+                                     base_rev=rev or "HEAD", base=base)
+            report = tracekit.regress(project, base)
+        lost = [item for item in report["items"] if item["blocks"]]
+        if report["broken"]:
+            lost.append({"id": "比較の基準", "what": report["reason"]})
+        notes, approvals = report["notes"], report["approvals"]
+    except tracekit.ConfigError:
+        pass  # git の管理下にない、最初のコミットがまだない、など。コミット前の検査に任せる
     if not errors and not outside and not lost:
-        if notes:  # 止めないが、エージェントが報告に含められるように知らせる
+        # 止めないが、エージェントが報告に含められるように知らせる（利用者は、これを読んで取り込むかを決める）
+        if notes:
             print("確かめてほしい点（python3 tools/tracekit.py regress）:\n  " + "\n  ".join(notes[:MAX_SHOWN]))
+        if approvals:
+            print("この作業で承認として記録されているもの（利用者が本当に承認したものか、報告で示すこと）:\n  "
+                  + "\n  ".join(f"{a['change']}（承認: {a['approved_by']}）: "
+                                 + ", ".join(a["accepts"] + a["quality_base"]) for a in approvals))
         return 0
     if errors:
         print(f"トレーサビリティ検査でエラーが {len(errors)} 件あります。直すか、直せない理由と残るリスクを"

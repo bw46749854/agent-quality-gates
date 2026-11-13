@@ -39,6 +39,8 @@ CHG_ID = re.compile(r"CHG-\d{3,}\Z")
 REQ_REF = re.compile(r"(?<![A-Za-z0-9-])(REQ-\d{3,})(?:/(AC-\d+))?")
 # 受け入れ条件の行。 "- **AC-1**: ..."
 AC_LINE = re.compile(r"^\s*[-*]\s+\*\*(AC-\d+)\*\*", re.M)
+# 受け入れ条件の文面。行の続き（字下げした次の行）も含める
+AC_TEXT = re.compile(r"^[ \t]*[-*][ \t]+\*\*(AC-\d+)\*\*[ \t]*[:：]?[ \t]*(.*(?:\n[ \t]+(?![-*][ \t]).*)*)", re.M)
 # 受け入れ条件を書いたつもりに見えるが、上の形になっていない行（`- AC-1:`、`- **AC-1:**`、`1. **AC-1**:` など）。
 # 黙って見落とすと「テストのない受け入れ条件」を検出できなくなるので、書式のエラーにする。
 AC_LIKE = re.compile(r"^[ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(AC-\d+)[*_]*[ \t]*[:：]", re.M)
@@ -151,6 +153,7 @@ class Requirement:
     verify: list[str]
     acs: list[str]
     path: str
+    ac_texts: dict[str, str] = field(default_factory=dict)  # 受け入れ条件 → 文面（空白を詰めたもの）
 
 
 @dataclass
@@ -495,6 +498,7 @@ class Project:
                 id=rid, title=str(meta.get("title", "")), status=status,
                 priority=str(meta.get("priority", "")), components=components,
                 verify=verify, acs=list(dict.fromkeys(acs)), path=rel,
+                ac_texts={ac: " ".join(text.split()) for ac, text in reversed(AC_TEXT.findall(body))},
             )
         return result
 
@@ -1171,7 +1175,9 @@ def base_revision(proj: Project) -> str | None:
     """比較の基準にするコミット。基準のブランチ（trace/config.toml の base_branch。既定は main）と、
     いまの作業との分かれ目。作業をコミットしていても、していなくても、基準は動かない。
 
-    git の外、または最初のコミットの前なら None。基準のブランチがなければ、いまのコミット。
+    git の外、最初のコミットの前、または基準のブランチ（手元にも origin/ にも）がなければ None。
+    基準のブランチがないときに、いまのコミットで代用してはいけない。コミットしてしまった後退が見えなくなる
+    （regress は、導入が済んでいれば「比べられない」として不合格にする）。
     """
     try:
         head = _git(proj.root, "rev-parse", "--verify", "-q", "HEAD^{commit}").strip()
@@ -1183,8 +1189,8 @@ def base_revision(proj: Project) -> str | None:
             _git(proj.root, "rev-parse", "--verify", "-q", f"{name}^{{commit}}")
         except subprocess.CalledProcessError:
             continue
-        return diff_start(proj.root, name)
-    return head
+        return diff_start(proj.root, name) if head else None
+    return None
 
 
 def _same_file(a: Path, b: Path) -> bool:
@@ -1209,9 +1215,17 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
     strict（プルリクエスト）: 進行中の変更記録も、今回の変更で追加・更新されたものだけを有効とみなす。
     変更する前にコンポーネントが1つもなければ（導入の途中）、何も挙げない。
     """
-    report = {"compared": base is not None and bool(base.components), "reason": "", "items": [], "notes": [],
-              "resolved_warnings": [], "approvals": []}
-    if base is None:
+    report = {"compared": base is not None and bool(base.components), "broken": False, "reason": "",
+              "items": [], "notes": [], "resolved_warnings": [], "approvals": []}
+    branch = str(proj.cfg["base_branch"])
+    if base is None and committed_components(proj.root, "HEAD"):
+        # 導入は済んでいる（コミットした台帳にコンポーネントがある）のに、比べる相手がない。
+        # 比べられないことを合格と同じに扱うと、基準のブランチを消す・別名にするだけで後退の検出が外れる
+        report["broken"] = True
+        report["reason"] = (f"基準のブランチ `{branch}`（手元にも origin/{branch} にも）が見つからないか、取り出せません。"
+                            "比べられないので、合格にしません。基準のブランチを戻すか、trace/config.toml の base_branch を、"
+                            "あなたが取り込みを行うブランチの名前にしてください（この設定の変更には承認が要ります）")
+    elif base is None:
         report["reason"] = ("変更する前の状態を取り出せません（git の管理下にない、最初のコミットの前、"
                             "または変更する前の台帳を読めない、のどれかです）")
     elif not base.components:
@@ -1265,6 +1279,16 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
             for ac in before.acs:
                 if ac not in now.acs:
                     item(f"{rid}/{ac}", f"受け入れ条件 {rid}/{ac} がなくなりました", (rid,))
+                elif before.ac_texts.get(ac, "") != now.ac_texts.get(ac, ""):
+                    # 番号が同じでも、意味が変わっているかもしれない。機械では良し悪しを決められないので報告する
+                    report["notes"].append(
+                        f"受け入れ条件 {rid}/{ac} の文面が変わりました。依頼に基づく変更か、意味が弱まっていないか、"
+                        f"それを確かめるテストも直したかを確かめてください: 前「{before.ac_texts.get(ac, '')}」"
+                        f"→ 後「{now.ac_texts.get(ac, '')}」")
+            for level in before.verify:
+                if level not in now.verify:
+                    item(f"{rid}/verify:{level}", f"要件 {rid} の検証レベルから {level} が外されました"
+                                                   f"（{level} のテストがなくても検査を通るようになります）", (rid,))
             continue
         ended.add(rid)
 
@@ -1320,6 +1344,26 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
         else:
             report["notes"].append(f"新しい警告（設計を見直す目安）: {finding.code}: {finding.message}")
 
+    # -- テストの補助ファイル（代用品、共通の準備など）。テストファイルではないので、どの要件にも結びつかない。
+    #    書き換えればテストを骨抜きにできるので、変わった・消えたものを報告する（足しただけなら報告しない）
+    prefixes = {re.split(r"[*?\[]", g.strip().removeprefix("./"), maxsplit=1)[0].rsplit("/", 1)[0] + "/"
+                for globs in proj.cfg["tests"].values() for g in globs}
+    prefixes.discard("/")
+
+    def helpers(project: Project) -> set[str]:
+        return {rel for rel in list_files(project.root)
+                if any(rel.startswith(p) for p in prefixes) and project.test_level(rel) is None
+                and not project.in_source_root(rel) and not project.is_ignored(rel)}
+
+    now_helpers = helpers(proj)
+    for rel in sorted(helpers(base)):
+        if rel not in now_helpers:
+            report["notes"].append(f"テストの補助ファイル {rel} がなくなりました。テストの準備や代用品が"
+                                   "弱まっていないか確かめてください")
+        elif not _same_file(proj.root / rel, base.root / rel):
+            report["notes"].append(f"テストの補助ファイル {rel} が変わりました。テストの準備や代用品が"
+                                   "弱まっていないか（何でも通すようになっていないか）確かめてください")
+
     # -- テストの大幅な変更。中身を抜いても要件IDが残っていれば、上の検査はどれも通る。機械では良し悪しを
     #    決められないので、不合格にはせず、人とレビューの目に入るようにする
     for rel in sorted(set(proj.test_files) & set(base.test_files)):
@@ -1339,6 +1383,8 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
 
 def render_regress(report: dict, base_name: str = "変更する前") -> str:
     out = [f"## 後退の検出（{base_name}との比較）", ""]
+    if report.get("broken"):
+        return "\n".join(out + [f"**比べられません（不合格）。** {report['reason']}"]) + "\n"
     if not report["compared"]:
         return "\n".join(out + [f"比べていません。{report['reason']}"]) + "\n"
     blocking = [i for i in report["items"] if i["blocks"]]
@@ -1787,15 +1833,18 @@ def doctor(root: Path, proj: "Project | None" = None, ci: bool = False,
     if inside:
         base_branch, branch = str(proj.cfg["base_branch"]), _current_branch(root)
         try:
-            _git(root, "rev-parse", "--verify", "-q", f"{base_branch}^{{commit}}")
+            if base_revision(proj) is None:
+                raise subprocess.CalledProcessError(1, "rev-parse")
             out.append(("OK", "比較の基準", f"{base_branch}（いまのブランチ: {branch or 'なし'}）"
                         + ("。基準のブランチの上にいます。変更は作業ブランチで行い、取り込みは人が行ってください"
                            if branch == base_branch else "")))
         except (OSError, subprocess.CalledProcessError):
-            out.append(("WARN", "比較の基準",
-                        f"基準のブランチ `{base_branch}` がありません。後退の検出は、直前のコミットとしか比べられません"
-                        "（コミットされた後退を見逃します）。trace/config.toml の base_branch を、"
-                        "人が取り込みを行うブランチの名前にしてください"))
+            introduced = bool(committed_components(root, "HEAD"))
+            out.append(("NG" if introduced else "WARN", "比較の基準",
+                        f"基準のブランチ `{base_branch}`（手元にも origin/{base_branch} にも）がありません。"
+                        + ("後退の検出が比べられないので、品質ゲートは不合格になります。" if introduced else
+                           "導入の途中なので、いまは止めません。")
+                        + "trace/config.toml の base_branch を、人が取り込みを行うブランチの名前にしてください"))
     if inside and not ci:
         try:
             hooks_path = _git(root, "config", "--get", "core.hooksPath").strip()
@@ -2114,7 +2163,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(report, ensure_ascii=False, indent=2))
             else:
                 print(render_regress(report, args.base or str(proj.cfg["base_branch"])), end="")
-            return 1 if any(item["blocks"] for item in report["items"]) else 0
+            return 1 if report["broken"] or any(item["blocks"] for item in report["items"]) else 0
 
         if args.command == "change":
             if args.change_command == "new":

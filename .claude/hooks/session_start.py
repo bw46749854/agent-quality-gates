@@ -3,17 +3,23 @@
 
 標準出力の内容が、そのままエージェントの文脈に入る。
 """
+import json
 import os
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve()
-sys.path.insert(0, str(HERE.parents[2] / "tools"))
+sys.path.insert(0, str(HERE.parent))
+from project_root import project_root, use_tools_of  # noqa: E402
 
 
 def main() -> int:
-    root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or HERE.parents[2]).resolve()
-
+    try:
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
+    except ValueError:
+        data = {}
+    root = project_root(data.get("cwd") if isinstance(data, dict) else None)  # worktree で作業していれば、そちら
+    use_tools_of(root)
     import tracekit
 
     tracekit.setup_output("utf-8")

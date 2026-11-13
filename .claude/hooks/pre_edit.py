@@ -28,7 +28,8 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve()
-sys.path.insert(0, str(HERE.parents[2] / "tools"))
+sys.path.insert(0, str(HERE.parent))
+from project_root import project_root, use_tools_of  # noqa: E402
 
 # 読むだけのコマンド。承認の項目名が出てきても、書き込みではないので確かめない
 READ_ONLY = re.compile(r"^\s*(?:grep|rg|cat|head|tail|less|wc|git\s+(?:diff|log|show|status|grep|blame))\b[^>|;&]*$")
@@ -66,17 +67,23 @@ def after_edit(tool_name: str, tool_input: dict, before: str) -> str:
 
 
 def main() -> int:
+    data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
+    tool_input = data.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        raise TypeError("tool_input がオブジェクトではありません")
+    target = tool_input.get("file_path") or tool_input.get("notebook_path")
+    # 編集されるファイルを含むプロジェクト（worktree で作業していれば、そちら）を検査する
+    if target and not Path(target).is_absolute():
+        target = str(Path(data.get("cwd") or project_root()) / target)
+    root = project_root(target or data.get("cwd"))
+    use_tools_of(root)
     import tracekit
 
     tracekit.setup_output("utf-8")
     if os.environ.get("TRACEKIT_PROBE"):  # doctor からの呼び出し。この hook が実際に呼ばれ、止められることを示す
         print(tracekit.PROBE_MARK, file=sys.stderr)
         return 2
-    data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
     tool_name = str(data.get("tool_name", ""))
-    tool_input = data.get("tool_input") or {}
-    if not isinstance(tool_input, dict):
-        raise TypeError("tool_input がオブジェクトではありません")
 
     if tool_name == "Bash":
         command = str(tool_input.get("command", ""))
@@ -86,13 +93,9 @@ def main() -> int:
                        "承認していない内容なら、許可しないでください")
         return 0
 
-    target = tool_input.get("file_path") or tool_input.get("notebook_path")
     if not target:
         return 0
-    root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or HERE.parents[2]).resolve()
     path = Path(target)
-    if not path.is_absolute():
-        path = Path(data.get("cwd") or root) / path
     try:
         rel = path.resolve().relative_to(root).as_posix()
     except ValueError:

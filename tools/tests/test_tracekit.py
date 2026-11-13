@@ -678,6 +678,33 @@ class HookTest(ShopCase):
         again = self.run_hook("on_stop.py", {"hook_event_name": "Stop", "stop_hook_active": True})
         self.assertEqual(again.returncode, 0)  # 止め続けて終われなくなることはない
 
+    def worktree(self):
+        """Claude Code が作る worktree。hook の CLAUDE_PROJECT_DIR は、元のフォルダ（self.root）を指したままになる。"""
+        tree = self.root / ".claude" / "worktrees" / "w1"
+        shutil.copytree(EXAMPLE, tree, ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(REPO / "tools", tree / "tools", ignore=shutil.ignore_patterns("__pycache__", "tests"))
+        return tree
+
+    def test_edits_in_a_worktree_are_checked_against_the_worktree(self):
+        # 以前は、worktree のファイルが元のフォルダから見て「本番コードではない場所」に見え、何も止めなかった
+        tree = self.worktree()
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": str(tree),
+                   "tool_input": {"file_path": str(tree / "src/order/service.py")}}
+        done = self.run_hook("pre_edit.py", payload)
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("COMP-ORDER", done.stderr)
+        outside = dict(payload, tool_input={"file_path": str(self.root.parent / "elsewhere" / "x.py")})
+        self.assertEqual(self.run_hook("pre_edit.py", outside).returncode, 0)  # 元のフォルダの外は見ない
+
+    def test_session_hooks_look_at_the_worktree_the_session_works_in(self):
+        tree = self.worktree()
+        (tree / "tests/unit/test_extra.py").write_text('"""REQ-999"""\n', encoding="utf-8")
+        stop = self.run_hook("on_stop.py", {"hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(tree)})
+        self.assertEqual(stop.returncode, 2)
+        self.assertIn("TEST-DANGLING", stop.stderr)
+        start = self.run_hook("session_start.py", {"hook_event_name": "SessionStart", "cwd": str(tree)})
+        self.assertIn("エラー 1 件", start.stdout)
+
     def test_hooks_answer_a_probe_so_that_doctor_can_tell_they_are_really_called(self):
         env = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.root), TRACEKIT_PROBE="1")
         for name, code in (("pre_edit.py", 2), ("on_stop.py", 0), ("session_start.py", 0)):

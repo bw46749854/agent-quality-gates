@@ -19,7 +19,8 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve()
-sys.path.insert(0, str(HERE.parents[2] / "tools"))
+sys.path.insert(0, str(HERE.parent))
+from project_root import project_root, use_tools_of  # noqa: E402
 MAX_SHOWN = 15
 
 
@@ -32,6 +33,8 @@ def read_input() -> dict:
 
 
 def main(data: dict) -> int:
+    root = project_root(data.get("cwd"))  # worktree で作業していれば、そちら
+    use_tools_of(root)
     import tracekit
 
     tracekit.setup_output("utf-8")
@@ -40,7 +43,6 @@ def main(data: dict) -> int:
         return 0
     if data.get("stop_hook_active"):
         return 0
-    root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or HERE.parents[2]).resolve()
 
     try:
         project = tracekit.Project(root)

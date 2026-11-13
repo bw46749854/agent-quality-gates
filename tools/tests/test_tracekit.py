@@ -68,9 +68,19 @@ class ShopCase(unittest.TestCase):
         return tracekit.change_new(self.project(), "後退を受け入れる", "chore", list(components),
                                    list(requirements), accepts=list(items), approved_by=approved_by)
 
-    def fill(self, path):
+    def fill(self, path, design="passed", test="passed"):
+        """空欄を埋める。レビューの状態は、既定では「独立したレビューで合格」にする（None なら触らない）。"""
+        text = re.sub(r"<!--.*?-->", "記入済み", path.read_text(encoding="utf-8"), flags=re.S)
+        path.write_text(text, encoding="utf-8")
+        self.set_reviews(path, design, test)
+
+    def set_reviews(self, path, design=None, test=None):
         text = path.read_text(encoding="utf-8")
-        path.write_text(re.sub(r"<!--.*?-->", "記入済み", text, flags=re.S), encoding="utf-8")
+        for key, value in (("design_review", design), ("test_review", test)):
+            if value is not None:
+                self.assertRegex(text, rf"(?m)^{key}:")
+                text = re.sub(rf"(?m)^{key}:.*$", f"{key}: {value}", text, count=1)
+        path.write_text(text, encoding="utf-8")
 
 
 class CheckTest(ShopCase):
@@ -455,6 +465,36 @@ class ChangeLifecycleTest(ShopCase):
         with self.assertRaises(tracekit.ConfigError):
             tracekit.change_new(self.project(), "要件なし", "feature", ["COMP-ORDER"], [])
 
+    def test_without_a_base_to_compare_a_self_review_is_not_enough(self):
+        # git の外では、変更の重要度を機械で判定できない。判定できないことを「軽微」と同じに扱わない
+        path, change_id = self.new_change()
+        self.fill(path, design="self", test="self")
+        log = []
+        self.assertFalse(tracekit.change_close(self.project(), change_id, echo=log.append))
+        self.assertIn("比べられない", "\n".join(log))
+        self.set_reviews(path, "passed", "passed")
+        self.assertTrue(tracekit.change_close(self.project(), change_id, echo=log.append))
+
+    def test_review_state_must_be_one_of_the_known_words(self):
+        path, _ = self.new_change()
+        self.set_reviews(path, design="ok")
+        self.assertIn("CHG-FORMAT", self.codes(matrix=False))
+
+    def test_finished_record_whose_review_was_rejected_or_not_done_is_an_error(self):
+        path, _ = self.new_change()
+        self.fill(path, design="passed", test="rejected")
+        self.replace("docs/changes/CHG-002.md", "status: active", "status: done")
+        self.assertIn("CHG-REVIEW", self.codes(matrix=False))
+        self.set_reviews(path, test="pending")
+        self.assertIn("CHG-REVIEW", self.codes(matrix=False))
+        self.set_reviews(path, test="self")
+        self.assertNotIn("CHG-REVIEW", self.codes(matrix=False))
+
+    def test_finished_record_written_before_review_states_existed_is_still_valid(self):
+        text = (self.root / "docs/changes/CHG-001.md").read_text(encoding="utf-8")
+        self.assertNotIn("design_review", text)  # サンプルの完了済みの記録は、古い書式のまま
+        self.assertEqual(self.codes(matrix=False), [])
+
 
 class VerifyTest(ShopCase):
     def test_example_passes(self):
@@ -527,7 +567,7 @@ class VerifyTest(ShopCase):
         status, detail, ok = self.gate_x('skip_reason = "画面がない"\nskip_kind = "not_applicable"\n'
                                          'skip_approved_by = "山田"\n')
         self.assertEqual((status, ok), ("SKIP", True))
-        self.assertIn("対象なし", detail)
+        self.assertIn("対象外", detail)
 
     def test_test_gate_that_ran_no_tests_does_not_pass(self):
         pattern = "count_pattern = 'Ran (\\d+) tests?'\n"
@@ -557,9 +597,61 @@ class VerifyTest(ShopCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(verify.main(["--root", str(self.root), "--report", str(report)]), 0)
-        self.assertIn("検証していません", out.getvalue().splitlines()[-1])
+        last = out.getvalue().splitlines()[-1]
+        self.assertIn("対象外 3", last)  # サンプルが外しているのは、どれも「確かめる対象がない」もの
+        self.assertNotIn("免除", last)
         data = json.loads(report.read_text(encoding="utf-8"))
         self.assertEqual(data["unverified"], ["types", "architecture", "e2e"])
+        self.assertEqual(data["not_applicable"], ["types", "architecture", "e2e"])
+        self.assertEqual(data["waived"], [])
+
+    def test_waived_gate_is_told_apart_from_a_gate_with_nothing_to_verify(self):
+        # 「対象がない」と「対象はあるが、今回は検証していない」を、同じ SKIP としてまとめて表示しない
+        self.append("trace/gates.toml", '\n[[gate]]\nid = "contract"\nname = "契約テスト"\nskip_reason = "道具の移行中"\n'
+                    'skip_kind = "waiver"\nskip_approved_by = "山田"\nskip_until = "2999-12-31"\n')
+        report = self.root / "out" / "gates.json"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(verify.main(["--root", str(self.root), "--report", str(report)]), 0)
+        text = out.getvalue()
+        self.assertIn("[SKIP:免除] contract", text)
+        self.assertIn("[SKIP:対象外] e2e", text)
+        last = text.splitlines()[-1]
+        self.assertIn("免除 1", last)
+        self.assertIn("contract", last)
+        self.assertIn("検証していません", last)
+        data = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(data["waived"], ["contract"])
+        self.assertEqual({g["id"]: g.get("kind") for g in data["gates"] if g["status"] == "SKIP"},
+                         {"types": "not_applicable", "architecture": "not_applicable",
+                          "e2e": "not_applicable", "contract": "waiver"})
+
+    def test_gates_left_out_of_a_partial_run_are_listed_as_not_run(self):
+        results, ok = verify.run_gates(self.root, only=["unit"], echo=lambda _: None)
+        self.assertTrue(ok)
+        status = {r["id"]: r["status"] for r in results}
+        self.assertEqual(status["unit"], "PASS")
+        self.assertEqual(status["integration"], "NOTRUN")
+        self.assertEqual(status["trace"], "NOTRUN")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(verify.main(["--root", str(self.root), "--only", "unit"]), 0)
+        self.assertIn("未実施", out.getvalue().splitlines()[-1])
+
+    def test_run_that_executed_nothing_is_not_a_pass(self):
+        _, ok = verify.run_gates(self.root, only=["no-such-gate"], echo=lambda _: None)
+        self.assertFalse(ok)
+
+    def test_comparison_that_could_not_be_made_is_recorded_as_not_run(self):
+        # 一時フォルダは git の管理下にないので、基準のブランチと比べられない。黙って結果から落とさない
+        results, ok = verify.run_gates(self.root, echo=lambda _: None)
+        self.assertTrue(ok)
+        regress = next(r for r in results if r["id"] == "regress")
+        self.assertEqual(regress["status"], "NOTRUN")
+        path, change_id = self.new_change()
+        self.fill(path)
+        self.assertTrue(tracekit.change_close(self.project(), change_id, echo=lambda _: None))
+        self.assertIn("[NOTRUN] regress", path.read_text(encoding="utf-8"))
 
     def test_report_file_records_every_gate(self):
         report = self.root / "out" / "gates.json"
@@ -567,8 +659,9 @@ class VerifyTest(ShopCase):
             self.assertEqual(verify.main(["--root", str(self.root), "--report", str(report)]), 0)
         data = json.loads(report.read_text(encoding="utf-8"))
         self.assertTrue(data["ok"])
-        self.assertEqual([g["id"] for g in data["gates"]][:2], ["trace", "static"])
-        self.assertEqual({g["status"] for g in data["gates"]}, {"PASS", "SKIP"})
+        self.assertEqual([g["id"] for g in data["gates"]][:3], ["trace", "regress", "static"])
+        self.assertEqual({g["status"] for g in data["gates"]}, {"PASS", "SKIP", "NOTRUN"})
+        self.assertEqual(data["not_run"], ["regress"])  # git の外なので、基準のブランチと比べていない
 
 
 class CliTest(ShopCase):
@@ -1341,6 +1434,187 @@ class GitDiffTest(GitCase):
         impact = tracekit.compute_impact(self.project(),
                                          files=tracekit.git_changed(self.root, base="HEAD"))
         self.assertEqual(impact["direct_components"], ["COMP-INVENTORY"])
+
+
+@unittest.skipUnless(shutil.which("git"), "git がありません")
+class ReviewTest(GitCase):
+    """レビューの結果と完了の判定。差し戻し・未実施のまま完了にしない。
+    重要な変更（基準のブランチとの差分から機械が判定する）には、独立したレビューの合格を求める。"""
+
+    REPORT = ('\n[[component]]\nid = "COMP-REPORT"\nname = "帳票"\nresponsibility = "帳票の書式を知っていて、出力を保証する"\n'
+              'paths = ["src/report/**"]\nshared = true\n')
+
+    def setUp(self):
+        super().setUp()
+        self.git("checkout", "-q", "-b", "work")
+
+    def close(self, change_id):
+        log = []
+        return tracekit.change_close(self.project(), change_id, echo=log.append), "\n".join(log)
+
+    def needs(self, change_id):
+        project = self.project()
+        with tracekit.snapshot(self.root, tracekit.base_revision(project)) as base:
+            return tracekit.review_needs(project, base, project.changes[change_id])
+
+    def test_rejected_review_blocks_completion_even_when_every_gate_passes(self):
+        # 試用で起きたこと: 機械のゲートはすべて合格、レビューは差し戻し、それでも完了にできた
+        path, change_id = self.new_change()
+        self.fill(path, design="rejected", test="passed")
+        ok, log = self.close(change_id)
+        self.assertFalse(ok)
+        self.assertIn("設計レビュー", log)
+        self.assertIn("差し戻し", log)
+        self.assertEqual(self.project().changes[change_id].status, "active")
+        self.set_reviews(path, design="passed")
+        ok, log = self.close(change_id)
+        self.assertTrue(ok, log)
+
+    def test_review_that_was_not_done_blocks_completion(self):
+        path, change_id = self.new_change()
+        self.fill(path, design=None, test=None)  # 作ったときのまま（pending）
+        ok, log = self.close(change_id)
+        self.assertFalse(ok)
+        self.assertIn("未実施", log)
+
+    def test_record_without_review_states_counts_as_not_reviewed(self):
+        # 進行中のまま残っていた古い書式の記録。レビューの項目がないことを、合格とみなさない
+        path, change_id = self.new_change()
+        self.fill(path)
+        text = path.read_text(encoding="utf-8")
+        path.write_text(re.sub(r"(?m)^(?:design|test)_review:.*\n", "", text), encoding="utf-8")
+        ok, log = self.close(change_id)
+        self.assertFalse(ok)
+        self.assertIn("design_review", log)
+
+    def test_small_change_is_complete_with_a_self_review(self):
+        self.append("src/order/service.py", "\n# 小さな修正\n")
+        path, change_id = self.new_change()
+        self.assertEqual(self.needs(change_id), {"design_review": [], "test_review": []})
+        self.fill(path, design="not_applicable", test="self")
+        ok, log = self.close(change_id)
+        self.assertTrue(ok, log)
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("設計レビュー: 対象外", text)       # 重要度の判定とレビューの結果は、検証結果に残る
+        self.assertIn("テストレビュー: セルフレビュー", text)
+
+    def test_new_component_needs_an_independent_design_review(self):
+        self.append("trace/components.toml", self.REPORT)
+        self.write("src/report/sheet.py", "TITLE = 1\n")
+        path, change_id = self.new_change(components=["COMP-ORDER", "COMP-REPORT"])
+        self.assertIn("COMP-REPORT", " ".join(self.needs(change_id)["design_review"]))
+        self.fill(path, design="self", test="self")  # 自分で「軽微」と申告しても通らない
+        ok, log = self.close(change_id)
+        self.assertFalse(ok)
+        self.assertIn("COMP-REPORT", log)
+        self.assertIn("独立", log)
+        self.set_reviews(path, design="not_applicable")
+        self.assertFalse(self.close(change_id)[0])
+        self.set_reviews(path, design="passed")
+        ok, log = self.close(change_id)
+        self.assertTrue(ok, log)
+        self.assertIn("COMP-REPORT", path.read_text(encoding="utf-8").split("## 検証結果")[1])
+
+    def test_changed_responsibility_dependency_or_boundary_needs_an_independent_design_review(self):
+        for old, new in (('responsibility = "注文の受付・取消と、注文の状態を管理する"', 'responsibility = "注文と請求を管理する"'),
+                         ('depends_on = ["COMP-INVENTORY"]', "depends_on = []"),
+                         ('paths = ["src/order/**"]', 'paths = ["src/order/**", "src/billing/**"]')):
+            with self.subTest(change=new):
+                ledger = (self.root / "trace/components.toml").read_text(encoding="utf-8")
+                self.replace("trace/components.toml", old, new)
+                _, change_id = self.new_change()
+                self.assertIn("COMP-ORDER", " ".join(self.needs(change_id)["design_review"]))
+                self.write("trace/components.toml", ledger)
+                (self.root / f"docs/changes/{change_id}.md").unlink()
+
+    def test_component_change_outside_this_change_does_not_raise_its_level(self):
+        # 同じブランチの別の変更が足したコンポーネントで、関係のない小さな変更まで重くしない
+        self.append("trace/components.toml", self.REPORT)
+        self.write("src/report/sheet.py", "TITLE = 1\n")
+        _, change_id = self.new_change(components=["COMP-ORDER"])
+        self.assertEqual(self.needs(change_id)["design_review"], [])
+        self.approved_change("trace/components.toml")  # 台帳そのものを変える変更は、範囲に入る
+        self.assertIn("COMP-REPORT", " ".join(self.needs("CHG-003")["design_review"]))
+
+    def test_changing_the_criteria_of_a_must_requirement_needs_an_independent_test_review(self):
+        self.replace("docs/requirements/REQ-001.md", "在庫が注文数だけ減る", "在庫が減る")
+        _, change_id = self.new_change(requirements=["REQ-001"])
+        reasons = " ".join(self.needs(change_id)["test_review"])
+        self.assertIn("REQ-001", reasons)
+        self.assertIn("AC-1", reasons)
+        self.assertEqual(self.needs(change_id)["design_review"], [])
+
+    def test_changing_a_requirement_that_is_not_must_is_left_to_a_self_review(self):
+        self.replace("docs/requirements/REQ-001.md", "priority: must", "priority: should")
+        self.land_on_main()
+        self.replace("docs/requirements/REQ-001.md", "在庫が注文数だけ減る", "在庫が減る")
+        _, change_id = self.new_change(requirements=["REQ-001"])
+        self.assertEqual(self.needs(change_id)["test_review"], [])
+
+    def test_lowering_the_priority_in_the_same_change_does_not_lower_the_level(self):
+        self.replace("docs/requirements/REQ-001.md", "priority: must", "priority: could")
+        self.replace("docs/requirements/REQ-001.md", "在庫が注文数だけ減る", "在庫が減る")
+        _, change_id = self.new_change(requirements=["REQ-001"])
+        self.assertIn("REQ-001", " ".join(self.needs(change_id)["test_review"]))
+
+    def test_new_must_requirement_needs_an_independent_test_review(self):
+        self.write("docs/requirements/REQ-003.md",
+                   "---\nid: REQ-003\ntitle: 新しい要件\nstatus: approved\npriority: must\n"
+                   "components: [COMP-ORDER]\nverify: [unit]\n---\n\n## 受け入れ条件\n"
+                   "- **AC-1**: WHEN x THEN y\n")
+        _, change_id = self.new_change(requirements=["REQ-003"], kind="feature")
+        self.assertIn("REQ-003", " ".join(self.needs(change_id)["test_review"]))
+
+    def test_cut_or_deleted_test_needs_an_independent_test_review(self):
+        self.replace("tests/unit/test_stock.py", "        self.assertEqual(reserve_stock(3, 3), 0)\n", "        pass\n")
+        _, change_id = self.new_change(requirements=["REQ-001"])
+        self.assertIn("tests/unit/test_stock.py", " ".join(self.needs(change_id)["test_review"]))
+        (self.root / "tests/unit/test_stock.py").unlink()
+        self.assertIn("tests/unit/test_stock.py", " ".join(self.needs(change_id)["test_review"]))
+
+    def test_added_test_does_not_need_an_independent_review(self):
+        self.write("tests/unit/test_more.py", '"""REQ-002/AC-1"""\nimport unittest\n\n\nclass T(unittest.TestCase):\n'
+                   "    def test_x(self):\n        self.assertEqual(1, 1)\n")
+        _, change_id = self.new_change()
+        self.assertEqual(self.needs(change_id)["test_review"], [])
+
+    def test_changed_gate_command_needs_an_independent_test_review(self):
+        self.replace("trace/gates.toml",
+                     'cmd = "PYTHONPATH=src python3 -m unittest discover -s tests/unit -q"',
+                     'cmd = "PYTHONPATH=src python3 -m unittest tests/unit/test_stock.py"')
+        self.approved_change("trace/gates.toml")
+        reasons = " ".join(self.needs("CHG-002")["test_review"])
+        self.assertIn("unit", reasons)
+        self.assertIn("ゲート", reasons)
+
+    def test_work_in_progress_can_be_committed_while_the_review_is_rejected(self):
+        # 完了を止めるのであって、途中の保存は止めない
+        self.append("src/order/service.py", "\n# 途中\n")
+        path, change_id = self.new_change()
+        self.fill(path, design="rejected", test="pending")
+        self.git("add", "-A")
+        self.assertEqual(self.cli("check", "--no-matrix"), 0)
+        self.assertEqual(self.cli("guard", "--staged"), 0)
+
+    def test_review_command_tells_the_level_the_reasons_and_what_is_missing(self):
+        self.append("trace/components.toml", self.REPORT)
+        self.write("src/report/sheet.py", "TITLE = 1\n")
+        path, change_id = self.new_change(components=["COMP-REPORT"])
+        code, text = self.cli_text("change", "review", change_id)
+        self.assertEqual(code, 1)
+        self.assertIn("設計レビュー: 独立したレビューが必須", text)
+        self.assertIn("COMP-REPORT", text)
+        self.assertIn("テストレビュー: セルフレビューで足りる", text)
+        self.set_reviews(path, design="passed", test="self")
+        code, text = self.cli_text("change", "review", change_id)
+        self.assertEqual(code, 0, text)
+
+    def test_status_shows_the_review_state_of_the_change_in_progress(self):
+        path, _ = self.new_change()
+        self.set_reviews(path, design="rejected")
+        text = tracekit.render_status(self.project())
+        self.assertIn("設計 差し戻し", text)
+        self.assertIn("テスト 未実施", text)
 
 
 class AdapterExamplesTest(unittest.TestCase):

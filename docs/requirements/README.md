@@ -20,7 +20,7 @@ verify: [unit, integration]
 |---|---|
 | `id` | `REQ-` と3桁以上の番号。一度付けたら変えない。廃止しても再利用しない |
 | `status` | 下の表を参照 |
-| `priority` | `must` / `should` / `could` |
+| `priority` | `must` / `should` / `could`。破られたときの損害が大きい要件は `must`。`must` の要件を定める・受け入れ条件を変える変更には、独立したテストレビューの合格が要る（[`docs/changes/README.md`](../changes/README.md) の「レビュー」） |
 | `components` | この要件を実現するコンポーネント（`trace/components.toml` のID）。設計の工程で埋める |
 | `verify` | この要件を確かめるテストのレベル（`trace/config.toml` の `[tests]` にある名前）。テスト設計の工程で埋める |
 

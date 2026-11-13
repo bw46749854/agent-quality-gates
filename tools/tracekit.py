@@ -50,7 +50,17 @@ CHG_STATUSES = ("active", "done", "abandoned")
 CHG_KINDS = ("feature", "fix", "refactor", "chore")
 REQ_KEYS = {"id", "title", "status", "priority", "components", "verify"}
 CHG_KEYS = {"id", "title", "status", "kind", "requirements", "components",
-            "quality_base", "accepts", "approved_by"}
+            "quality_base", "accepts", "approved_by", "design_review", "test_review"}
+# 変更記録に書くレビューの結果。設計とテストのそれぞれについて、状態を1つ書く。
+REVIEWS = {"design_review": "設計レビュー", "test_review": "テストレビュー"}
+REVIEWERS = {"design_review": "design-reviewer", "test_review": "test-reviewer"}
+REVIEW_STATES = {
+    "pending": "未実施",                 # まだ見ていない。完了にできない
+    "passed": "合格",                    # 独立したレビュー（実装した本人とは別の目）で合格した
+    "rejected": "差し戻し",              # 独立したレビューで、直すべき重大な指摘が残っている。完了にできない
+    "self": "セルフレビュー済み",        # 実装した本人が見直した。重要な変更では足りない
+    "not_applicable": "対象外",          # 見る対象がない（理由を「レビュー」の節に書く）。重要な変更では足りない
+}
 COMP_KEYS = {"id", "name", "responsibility", "paths", "depends_on",
              "reference_patterns", "status", "shared"}
 CHG_REQUIRED_SECTIONS = ("目的", "変更内容", "台帳に現れない影響の調査",
@@ -76,8 +86,8 @@ QUALITY_BASE = (
 
 # ゲートを実行しないときの区分
 SKIP_KINDS = {
-    "not_applicable": "対象なし",       # 確かめる対象がそもそもない（画面のないライブラリの E2E など）。期限は要らない
-    "waiver": "期限つきの免除",         # 対象はあるが、一時的に外す。期限（skip_until）が要る
+    "not_applicable": "対象外",         # 確かめる対象がそもそもない（画面のないライブラリの E2E など）。期限は要らない
+    "waiver": "免除",                   # 対象はあるが、一時的に外す（承認された例外）。期限（skip_until）が要る
 }
 # 新しく出たら止める警告（要件・コード・テストの対応が欠けたことを示すもの）。
 # ほかの警告（粒度など、設計を見直す目安）は、新しく出ても止めずに報告する。以前からある警告は、どれも止めない。
@@ -168,6 +178,11 @@ class Change:
     quality_base: list[str] = field(default_factory=list)  # 変更してよい品質基盤のパス（glob）
     accepts: list[str] = field(default_factory=list)       # 受け入れる後退（要件・受け入れ条件・テスト・警告の ID）
     approved_by: str = ""                                   # quality_base と accepts を承認した人
+    reviews: dict[str, str] = field(default_factory=dict)   # レビューの結果（REVIEWS のキー → REVIEW_STATES）。書かれた項目だけ
+
+    def review(self, key: str) -> str:
+        """レビューの状態。項目がない・空なら、未実施（pending）として扱う。"""
+        return self.reviews.get(key) or "pending"
 
 
 def glob_to_re(glob: str) -> re.Pattern:
@@ -359,8 +374,11 @@ def gate_state(gate: dict, today: datetime.date | None = None) -> tuple[str, str
     if until and (today or datetime.date.today()) > until:
         return "FAIL", (f"実行しない期限（{until.isoformat()}）を過ぎています。ゲートを設定するか、"
                         "承認を取り直して skip_until を更新してください")
-    return "SKIP", (f"検証していません（{SKIP_KINDS[kind]}）。理由: {reason}／承認: {approver}／"
-                    f"期限: {until.isoformat() if until else 'なし'}")
+    if kind == "not_applicable":
+        return "SKIP", (f"対象外（確かめる対象がない）。理由: {reason}／承認: {approver}"
+                        + (f"／期限: {until.isoformat()}" if until else ""))
+    return "SKIP", (f"検証していません（期限つきの免除）。理由: {reason}／承認: {approver}／"
+                    f"期限: {until.isoformat()}")
 
 
 # --------------------------------------------------------------------------- 台帳の読み込み
@@ -533,11 +551,17 @@ class Project:
             if kind not in CHG_KINDS:
                 self._err("CHG-FORMAT", f"{cid}: kind は {' / '.join(CHG_KINDS)} のどれかです", rel)
                 continue
+            reviews = {key: str(meta[key]).strip() for key in REVIEWS if key in meta}
+            for key, state in reviews.items():
+                if state and state not in REVIEW_STATES:
+                    self._err("CHG-FORMAT", f"{cid}: {key} は {' / '.join(REVIEW_STATES)} のどれかです"
+                              f"（`{state}` とは書けません）", rel)
             result[cid] = Change(id=cid, title=str(meta.get("title", "")), status=status,
                                  kind=kind, requirements=requirements,
                                  components=components, path=rel, quality_base=quality_base,
                                  accepts=accepts,
-                                 approved_by=str(meta.get("approved_by", "")).strip())
+                                 approved_by=str(meta.get("approved_by", "")).strip(),
+                                 reviews={k: v for k, v in reviews.items() if not v or v in REVIEW_STATES})
         return result
 
     # ---- パスの分類
@@ -879,6 +903,14 @@ def check(proj: Project, matrix: bool = True) -> list[Finding]:
                 "書いていますが、承認した人（approved_by）が書かれていません。利用者に説明して承認を得てから、"
                 "その人の名前を書いてください（承認が得られないなら、quality_base・accepts を消して、変更をやめます）",
                 change.path)
+        if change.status == "done":
+            # レビューの項目がない完了済みの記録（この項目ができる前のもの）は、そのまま認める
+            for key in change.reviews:
+                if change.review(key) in ("pending", "rejected"):
+                    err("CHG-REVIEW", f"{change.id}: 完了済み（done）ですが、{REVIEWS[key]}が"
+                        f"{REVIEW_STATES[change.review(key)]}（{key}: {change.review(key)}）のままです。"
+                        "レビューが済んでいない変更は、完了ではありません（status を手で書き換えず、"
+                        "`python3 tools/tracekit.py change close` で完了にします）", change.path)
 
     # -- 粒度（粗すぎ・散らばりすぎ）
     gran = proj.cfg["granularity"]
@@ -1255,7 +1287,9 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
     変更する前にコンポーネントが1つもなければ（導入の途中）、何も挙げない。
     """
     report = {"compared": base is not None and bool(base.components), "broken": False, "reason": "",
-              "items": [], "notes": [], "resolved_warnings": [], "approvals": []}
+              "items": [], "notes": [], "resolved_warnings": [], "approvals": [],
+              # 消えた・減った・大きく削られたテスト（承認の有無に関わらず）。独立したテストレビューが要るかの判定に使う
+              "weakened_tests": []}
     branch = str(proj.cfg["base_branch"])
     if base is None and committed_components(proj.root, "HEAD"):
         # 導入は済んでいる（コミットした台帳にコンポーネントがある）のに、比べる相手がない。
@@ -1292,6 +1326,9 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
                     "change": change.id, "approved_by": change.approved_by,
                     "accepts": list(change.accepts), "quality_base": list(change.quality_base)})
     seen: set[str] = set()
+
+    def weakened(what: str, requirement_ids) -> None:
+        report["weakened_tests"].append({"what": what, "requirements": sorted(set(requirement_ids))})
 
     def item(item_id: str, what: str, parents: tuple = ()) -> None:
         if item_id in seen:
@@ -1340,7 +1377,10 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
         if not now_files:
             item(f"{rid}/{ac}", f"受け入れ条件 {rid}/{ac} を確かめるテストが1つもなくなりました"
                                 f"（以前: {', '.join(sorted(before_files))}）", (rid,))
+            weakened(f"受け入れ条件 {rid}/{ac} を確かめるテストが1つもなくなった", [rid])
         elif len(now_files) < len(before_files):
+            weakened(f"受け入れ条件 {rid}/{ac} を確かめるテストが減った"
+                     f"（{', '.join(sorted(before_files - now_files))}）", [rid])
             report["notes"].append(
                 f"{rid}/{ac} を確かめるテストが減りました: {', '.join(sorted(before_files - now_files))} から"
                 f"なくなり、残りは {', '.join(sorted(now_files))} です")
@@ -1357,6 +1397,7 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
         item(rel, f"テストファイル {rel} がなくなりました（確かめていたもの: "
                   f"{', '.join(sorted(f'{rid}/{ac}' if ac else rid for rid, ac in refs))}）",
              owners if covered else ())
+        weakened(f"テストファイル {rel} がなくなった", [rid for rid, _ in refs])
 
     # -- 完了済みの変更記録は履歴
     for cid, before in sorted(base.changes.items()):
@@ -1414,6 +1455,8 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
         before_lines = sum(1 for line in before_text.splitlines() if line.strip())
         now_lines = sum(1 for line in now_text.splitlines() if line.strip())
         if now_checks < before_checks or now_lines * 2 < before_lines:
+            weakened(f"テスト {rel} が削られた（確かめる文 {before_checks} → {now_checks} 行、"
+                     f"全体 {before_lines} → {now_lines} 行）", [rid for rid, _ in base.test_refs.get(rel, ())])
             report["notes"].append(
                 f"テスト {rel} が大きく変わっています: 確かめる文（assert / expect など）が {before_checks} → "
                 f"{now_checks} 行、全体が {before_lines} → {now_lines} 行。確かめる内容が弱まっていないか、"
@@ -1598,6 +1641,8 @@ status: active
 kind: {kind}
 requirements: [{requirements}]
 components: [{components}]
+design_review: pending
+test_review: pending
 {approval}---
 
 ## 目的
@@ -1614,7 +1659,7 @@ components: [{components}]
 <!-- 上の「実行すべきテスト」に加えて、新しく追加・修正するテストを書く。 -->
 
 ## レビュー
-<!-- design-reviewer・test-reviewer に頼んだ結果（判定と、指摘への対応）。頼めなかった・頼まなかったなら、その理由と、代わりに誰が何を見るか。 -->
+<!-- 設計とテストのそれぞれについて、誰が見て、判定がどうで、指摘にどう対応したかを書く。独立したレビュー（design-reviewer・test-reviewer、または実装した本人以外の人）が必須かどうかは `python3 tools/tracekit.py change review {id}` が判定する。必須でなければ、セルフレビューの結果（何を見直し、何を直したか）を1〜3行で書く。対象外なら、その理由を書く。判定は、先頭部分の design_review・test_review にも書く（passed / rejected / self / not_applicable）。 -->
 
 ## 不確実な点・残るリスク
 <!-- 影響を特定しきれなかった点。なければ「なし」と書く。 -->
@@ -1655,6 +1700,145 @@ def change_new(proj: Project, title: str, kind: str, components: list[str],
             f"approved_by: {approved_by}\n" if quality_base or accepts else ""]),
         impact=render_impact(proj, impact)), encoding="utf-8")
     return path
+
+
+def _covers(change: Change, rel: str) -> bool:
+    return any(glob_to_re(g).match(rel) for g in change.quality_base)
+
+
+def review_needs(proj: Project, base: Project | None, change: Change) -> dict[str, list[str]]:
+    """この変更に、独立したレビュー（実装した本人とは別の目）の合格が必須になる理由。
+
+    REVIEWS のキーごとに、理由の一覧を返す。空なら、セルフレビューで足りる。
+    変更が重要かどうかを自己申告に任せると、重大な変更を「軽微」と書くだけでレビューを省ける。
+    そこで、変更する前（base。基準のブランチとの分かれ目）との差分から決める。
+
+    設計レビュー: この変更の範囲（components、または台帳を quality_base に含む）で、コンポーネントの
+                  新設・削除、責務・依存先・境界（paths）・状態の変更があった
+    テストレビュー: この変更の requirements にある重要な要件（priority: must）を新しく定めた・なくした・
+                  受け入れ条件や検証レベルを変えた／それらの要件を確かめていたテストが消えた・減った・
+                  大きく削られた／品質ゲート（この変更の quality_base に trace/gates.toml がある）の
+                  実行内容が変わった
+
+    ここに挙がらない変更でも、独立したレビューを受けてよい（公開している入口の変更など、機械に見えないもの）。
+    比べる相手がない（base が None）ときは、重要度を判定できないので、両方とも必須にする。
+    """
+    if base is None:
+        why = ("変更する前の状態と比べられないため、変更の重要度を判定できません"
+               "（git の管理下にない、基準のブランチがない、最初のコミットの前、のどれかです）")
+        return {key: [why] for key in REVIEWS}
+    needs: dict[str, list[str]] = {key: [] for key in REVIEWS}
+
+    # -- 設計: コンポーネントの台帳の差分
+    ledger = _covers(change, "trace/components.toml")
+    for cid in sorted(set(proj.components) | set(base.components)):
+        if not (ledger or cid in change.components):
+            continue  # ほかの変更が扱っているコンポーネント
+        now, before = proj.components.get(cid), base.components.get(cid)
+        if before is None:
+            needs["design_review"].append(f"コンポーネント {cid} を新設した")
+        elif now is None:
+            needs["design_review"].append(f"コンポーネント {cid} をなくした")
+        else:
+            changed = [label for label, a, b in (
+                ("責務", " ".join(before.responsibility.split()), " ".join(now.responsibility.split())),
+                ("依存先", sorted(before.depends_on), sorted(now.depends_on)),
+                ("境界（paths）", sorted(before.paths), sorted(now.paths)),
+                ("状態（status）", before.status, now.status)) if a != b]
+            if changed:
+                needs["design_review"].append(f"コンポーネント {cid} の{'・'.join(changed)}が変わった")
+
+    # -- テスト: 重要な要件（priority: must）の変更。変更の前か後のどちらかで must なら、重要として扱う
+    #    （同じ変更の中で優先度を下げても、水準は下がらない）
+    for rid in change.requirements:
+        now, before = proj.requirements.get(rid), base.requirements.get(rid)
+        if "must" not in {r.priority for r in (now, before) if r is not None}:
+            continue
+        settled_before = before is not None and before.status not in ("draft", "deprecated")
+        settled_now = now is not None and now.status not in ("draft", "deprecated")
+        if not settled_before and settled_now:
+            needs["test_review"].append(f"重要な要件 {rid}（priority: must）を新しく定めた")
+        elif settled_before and not settled_now:
+            needs["test_review"].append(f"重要な要件 {rid}（priority: must）をなくした・廃止した・draft に戻した")
+        elif settled_before and settled_now:
+            changed = [f"{ac} を追加" for ac in now.acs if ac not in before.acs]
+            changed += [f"{ac} を削除" for ac in before.acs if ac not in now.acs]
+            changed += [f"{ac} の文面" for ac in before.acs
+                        if ac in now.acs and before.ac_texts.get(ac, "") != now.ac_texts.get(ac, "")]
+            if sorted(before.verify) != sorted(now.verify):
+                changed.append("検証レベル（verify）")
+            if changed:
+                needs["test_review"].append(
+                    f"重要な要件 {rid}（priority: must）の受け入れ条件が変わった（{'、'.join(changed)}）")
+
+    # -- テスト: この変更の要件を確かめていたテストが、消えた・減った・大きく削られた
+    in_scope = set(change.requirements)
+    for entry in regress(proj, base)["weakened_tests"]:
+        if in_scope & set(entry["requirements"]) and entry["what"] not in needs["test_review"]:
+            needs["test_review"].append(entry["what"])
+
+    # -- テスト: 品質ゲートの実行内容の変更（以前は実行していたゲートだけを見る）
+    if _covers(change, "trace/gates.toml"):
+        try:
+            before_gates = {str(g["id"]): g for g in load_gates(base.root)}
+            now_gates = {str(g["id"]): g for g in load_gates(proj.root)}
+        except ConfigError:
+            before_gates = now_gates = {}  # 読めない定義は、trace のゲートが不合格にする
+        for gate_id, before_gate in before_gates.items():
+            if not str(before_gate.get("cmd", "")).strip():
+                continue
+            now_gate = now_gates.get(gate_id)
+            if now_gate is None:
+                needs["test_review"].append(f"品質ゲート {gate_id} がなくなった")
+                continue
+            changed = [label for label, key in (("コマンド（cmd）", "cmd"), ("件数の読み取り（count_pattern）", "count_pattern"),
+                                                ("必須の指定（required）", "required"), ("レベル（levels）", "levels"))
+                       if before_gate.get(key) != now_gate.get(key)]
+            if changed:
+                needs["test_review"].append(f"品質ゲート {gate_id} の{'・'.join(changed)}が変わった")
+    return needs
+
+
+def review_problems(change: Change, needs: dict[str, list[str]]) -> list[str]:
+    """レビューの状態が、完了の条件を満たしていない点。空なら、完了にしてよい。
+
+    差し戻し（rejected）と未実施（pending）は、どの変更でも完了にできない。
+    独立したレビューが必須の変更（needs に理由がある）は、合格（passed）だけを認める。
+    """
+    problems = []
+    for key, label in REVIEWS.items():
+        state, reasons = change.review(key), needs.get(key, [])
+        if state == "rejected":
+            problems.append(f"{label}が差し戻し（{key}: rejected）のままです。重大な指摘を直して、もう一度レビューを"
+                            f"受け、合格したら {key}: passed に書き換えてください。直せない・指摘に同意できないときは、"
+                            "完了にせず、利用者に判断を求めます")
+        elif reasons and state != "passed":
+            problems.append(f"{label}は、独立したレビュー（{REVIEWERS[key]} か、実装した本人以外の人）の合格が必須です"
+                            f"（いまの記録: {key}: {state}＝{REVIEW_STATES[state]}）。理由: {'／'.join(reasons)}。"
+                            f"レビューを受けて、合格なら {key}: passed、差し戻しなら rejected と書いてください")
+        elif state == "pending":
+            problems.append(f"{label}が未実施です（{key}: pending、または項目がない）。この変更は、セルフレビューで"
+                            f"足ります。見直した結果を「レビュー」の節に書き、{key}: self（自分で見直した）か "
+                            "not_applicable（見る対象がない。理由を書く）にしてください"
+                            "（独立したレビューを受けたなら passed / rejected）")
+    return problems
+
+
+def render_review(change: Change, needs: dict[str, list[str]], record: bool = False) -> list[str]:
+    """レビューの水準（独立したレビューが必須か）と、いまの状態。record=True は、検証結果に残す1行ずつの形。"""
+    out = []
+    for key, label in REVIEWS.items():
+        state, reasons = change.review(key), needs.get(key, [])
+        if record:
+            out.append(f"- {label}: {REVIEW_STATES[state]}（求めた水準: "
+                       + (f"独立したレビュー。理由: {'／'.join(reasons)}" if reasons else
+                          "セルフレビュー。独立したレビューが必須になる変更なし") + "）")
+            continue
+        out.append(f"- {label}: " + ("独立したレビューが必須" if reasons else
+                                     "セルフレビューで足りる（独立したレビューが必須になる変更はありません）")
+                   + f"／いまの記録: {REVIEW_STATES[state]}（{key}: {state}）")
+        out += [f"  - 理由: {reason}" for reason in reasons]
+    return out
 
 
 def _sections(body: str) -> dict[str, str]:
@@ -1698,6 +1882,9 @@ def change_close(proj: Project, change_id: str, echo=print) -> bool:
         if req is not None and req.status not in ("implemented", "deprecated"):
             problems.append(f"{rid} の status が {req.status} のままです"
                             "（実装とテストが済んだら implemented にする）")
+    with snapshot(proj.root, base_revision(proj)) as base:
+        needs = review_needs(proj, base, change)
+    problems += review_problems(change, needs)
     if problems:
         echo(f"{change_id} を完了にできません:")
         for problem in problems:
@@ -1717,7 +1904,8 @@ def change_close(proj: Project, change_id: str, echo=print) -> bool:
     head = git_head(proj.root)
     if head:
         lines.append(f"- 検証した時点のコミット: {head}")
-    lines += [f"- [{r['status']}] {r['id']}（{r['name']}）: {r['detail']}" for r in results]
+    lines += [f"- [{r.get('label', r['status'])}] {r['id']}（{r['name']}）: {r['detail']}" for r in results]
+    lines += render_review(change, needs, record=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
     _set_status(path, "done")
@@ -1753,7 +1941,10 @@ def render_status(proj: Project) -> str:
     if active:
         out.append("- 進行中の変更:")
         out += [f"  - {c.id} {c.title}（範囲: {', '.join(c.components) or 'なし'}／"
-                f"要件: {', '.join(c.requirements) or 'なし'}）→ {c.path}" for c in active]
+                f"要件: {', '.join(c.requirements) or 'なし'}／レビュー: "
+                + "・".join(f"{label.removesuffix('レビュー')} {REVIEW_STATES[c.review(key)]}"
+                           for key, label in REVIEWS.items())
+                + f"）→ {c.path}" for c in active]
     else:
         out.append("- 進行中の変更: なし。本番コードを編集する前に、影響分析をして変更記録を作ること")
     branch = _current_branch(proj.root)
@@ -1856,7 +2047,8 @@ def doctor(root: Path, proj: "Project | None" = None, ci: bool = False,
         states = {str(g["id"]): gate_state(g)[0] for g in gates}
         unset = [gid for gid, state in states.items() if state == "UNSET"]
         refused = [gid for gid, state in states.items() if state == "FAIL"]
-        skipped = [gid for gid, state in states.items() if state == "SKIP"]
+        skipped = [f"{g['id']}（{SKIP_KINDS[str(g.get('skip_kind'))]}）" for g in gates
+                   if states[str(g["id"])] == "SKIP"]
         bad = []
         if not gates:
             bad.append("ゲートが1つもありません")
@@ -2122,6 +2314,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="変更する品質基盤のパス（カンマ区切り。glob 可）。承認した人は、承認を得てから変更記録に書く")
     c.add_argument("--accepts", default="",
                    help="受け入れる後退の ID（カンマ区切り。`regress` が挙げたもの）。承認した人は、承認を得てから書く")
+    c = csub.add_parser("review", help="独立したレビューが必須か（基準のブランチとの差分から判定）と、いまのレビューの状態")
+    c.add_argument("id")
     c = csub.add_parser("close")
     c.add_argument("id")
     c = csub.add_parser("abandon")
@@ -2219,6 +2413,21 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{path.relative_to(proj.root).as_posix()} を作りました。"
                       "空欄（<!-- --> の部分）を埋めてから実装に進んでください")
                 return 0
+            if args.change_command == "review":
+                change = proj.changes.get(args.id)
+                if change is None:
+                    raise ConfigError(f"変更記録 {args.id} がありません")
+                with snapshot(proj.root, base_revision(proj)) as base:
+                    needs = review_needs(proj, base, change)
+                print(f"## {change.id} のレビュー（必要な水準は、基準のブランチ {proj.cfg['base_branch']} との差分から判定）")
+                print("\n".join(render_review(change, needs)))
+                problems = review_problems(change, needs) if change.status == "active" else []
+                if problems:
+                    print("完了（change close）にするには:")
+                    print("\n".join(f"  - {problem}" for problem in problems))
+                elif change.status == "active":
+                    print("レビューについては、完了の条件を満たしています")
+                return 1 if problems else 0
             if args.change_command == "close":
                 return 0 if change_close(proj, args.id) else 1
             if args.change_command == "abandon":

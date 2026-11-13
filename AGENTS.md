@@ -15,6 +15,7 @@
 | 要件 ⇔ コンポーネント ⇔ コード ⇔ テスト の対応 | 上の2つ ＋ コードの置き場所 ＋ テストに書いた要件ID | `tracekit.py check` |
 | 変更の影響分析 | `docs/changes/CHG-*.md` | hook（記録のない編集を止める）、`tracekit.py guard` |
 | テストによる検証 | テストコードと `trace/gates.toml` | `verify.py`、テストレビュー |
+| 設計とテストのレビューの結果 | 変更記録の `design_review`・`test_review` と「レビュー」の節 | `tracekit.py change review`、`change close`（差し戻し・未実施を完了にしない） |
 | 品質基盤（ゲートの定義、台帳、検査ツール、hook、CI、この行動規約） | `trace/gates.toml`、`trace/config.toml`、`trace/components.toml`、`tools/`、`.github/workflows/`、`.claude/`、`AGENTS.md` | hook、`tracekit.py guard`（承認の記録のない変更を止める） |
 | 以前あった保証（要件・受け入れ条件・テスト・その対応） | 基準のブランチ（`trace/config.toml` の `base_branch`。既定は `main`）の状態 | `tracekit.py regress`、`tracekit.py guard`、`verify.py` の `regress` ゲート（承認のない後退を止める） |
 
@@ -39,6 +40,11 @@
 - **作業ブランチで変更する。基準のブランチ（`main`）に直接コミットしない。** `main` は、利用者が内容を確かめて取り込んだ状態で、検査が比較の基準にする。`main` への取り込み（マージ）は利用者が行う。
 - **本番コードを編集する前に、進行中の変更記録を用意する。** その変更記録の `components` に入っていないコンポーネントは編集しない。範囲が広がったら、影響分析をやり直して記録を更新する。
 - **内容の固まった要件（`draft` 以外）を変えたら、変更記録の `requirements` に入れる。** 受け入れ条件を黙って書き換えない。
+- **レビューが済んでいない変更を、完了にしない。** 変更記録の `design_review`・`test_review` に、レビューの結果を書く。
+  差し戻し（`rejected`）と未実施（`pending`）のままでは、完了にできない（途中のコミットはしてよい）。独立したレビュー
+  （`design-reviewer`・`test-reviewer`、または実装した本人以外の人）が必須かどうかは、`tracekit.py change review` が
+  基準のブランチとの差分から判定する。自分で「軽微」と判断して省かない。それ以外の変更は、自分で見直すセルフレビューで足りる。
+  受けていないレビューを `passed` と書かない。
 - **変更が済んだら、変更記録を閉じる。** 進行中のまま残した変更記録は、あとの無関係な編集まで通してしまう。
 - **新しいコードは、台帳に宣言されたコンポーネントの置き場所に置く。** どこにも属さない場所に置きたくなったら、それは設計の変更なので、設計に戻る。
 - **宣言していない依存を作らない。** 必要になったら、動かすために黙って足すのではなく、設計の変更として `trace/components.toml` と `docs/architecture.md` を更新し、理由を残す。台帳（`trace/components.toml`）は品質基盤なので、変える前に利用者の承認を得る。
@@ -74,7 +80,8 @@ python3 tools/tracekit.py impact --base main             # 変更後: 基準の�
 python3 tools/tracekit.py change new --title "…" --kind fix --components COMP-X --requirements REQ-001
 python3 tools/tracekit.py change new --title "…" --kind chore --quality-base trace/gates.toml   # 品質基盤を変えるとき（承認した人は、承認を得てから Edit で書く）
 python3 tools/tracekit.py regress                # 基準のブランチと比べて、失われたもの・弱まったもの（後退）を報告する
-python3 tools/tracekit.py change close CHG-001   # 全ゲートを実行し、通れば完了にする
+python3 tools/tracekit.py change review CHG-001  # 独立したレビューが必須か（差分から判定）と、いまのレビューの状態
+python3 tools/tracekit.py change close CHG-001   # レビューの状態を確かめ、全ゲートを実行し、通れば完了にする
 python3 tools/tracekit.py matrix --write         # マトリクスを作り直す
 python3 tools/verify.py                          # 品質ゲートを一括実行
 ```
@@ -82,7 +89,10 @@ python3 tools/verify.py                          # 品質ゲートを一括実�
 ## 報告のしかた
 
 - 実行していないテストを「実行した」と書かない。確かめていないことを「確認済み」と書かない。
-- `verify.py` の結果は、SKIP と UNSET も含めてそのまま伝える。SKIP は合格ではなく、「承認つきで検証を外している」と伝える。
+- `verify.py` の結果は、そのまま伝える。「実行して合格（PASS）」「実行して失敗（FAIL）」「対象外（SKIP:対象外。確かめる対象がない）」
+  「承認された例外（SKIP:免除。対象があるのに検証していない）」「未設定（UNSET）」「今回は実行していない（NOTRUN）」を混ぜない。
+  PASS 以外は、合格ではない。
+- レビューは、求められた水準（独立したレビューか、セルフレビューか）と判定を伝える。セルフレビューを「レビューで合格した」と書かない。
 - 基準を満たせなかったときは、満たせなかった点・理由・残るリスク・解決案を書く。満たしたことにしない。
-- 完了報告には、対応する要件ID、変更したコンポーネント、設計上の判断と理由、追加・変更したテスト、ゲートの結果、残るリスクを含める。
+- 完了報告には、対応する要件ID、変更したコンポーネント、設計上の判断と理由、追加・変更したテスト、ゲートの結果、レビューの結果、残るリスクを含める。
 - `tracekit.py regress` の「承認済みの後退」「確かめてほしい点」「承認として記録されているもの」は、そのまま報告に含める。利用者は、これを読んで `main` に取り込むかを決める。

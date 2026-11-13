@@ -22,11 +22,11 @@ description: 機能の追加・変更・不具合の修正・リファクタリ�
 | # | 工程 | skill | この工程を終えたと言える条件 |
 |---|---|---|---|
 | 1 | 要件を定める | `define-requirements` | 要件ファイルがあり、受け入れ条件がテストできる形で書かれている（`status: draft`） |
-| 2 | 設計する | `design-architecture` | 担当するコンポーネントが台帳にあり、要件の `components` が埋まり、`design-reviewer` の指摘が片づいている |
+| 2 | 設計する | `design-architecture` | 担当するコンポーネントが台帳にあり、要件の `components` が埋まっている。コンポーネントの新設・責務・依存先・境界を変えたなら、`design-reviewer` の重大な指摘が片づいている |
 | 3 | 影響を調べる | `analyze-impact` | 進行中の変更記録があり、空欄が埋まっている |
 | 4 | テストを設計する | `design-tests` | 要件の `verify` が埋まり、受け入れ条件ごとにテストの案があり、要件を `status: approved` にした |
 | 5 | 実装する | `implement-change` | 受け入れ条件のテストがすべて通り、要件を `status: implemented` にし、`tracekit.py check` にエラーがない |
-| 6 | 検証して完了にする | `verify-and-report` | `tracekit.py change close` が通り、報告を出した |
+| 6 | 検証して完了にする | `verify-and-report` | レビューが済み（差し戻し・未実施が残っていない）、`tracekit.py change close` が通り、報告を出した |
 
 ## 依頼の種類ごとの入り方
 
@@ -37,6 +37,11 @@ description: 機能の追加・変更・不具合の修正・リファクタリ�
 - **調査・質問だけ**: この流れは不要。コードを変えずに答える。
 
 小さな変更でも工程は飛ばさない。小さければ、各工程が数行で済む。
+
+レビューの重さは、変更の重要度で変わる。コンポーネントの新設や責務・依存の変更、重要な要件（`priority: must`）の
+新設・変更、テストの削除・削減、品質ゲートの実行内容の変更には、独立したレビュー（`design-reviewer`・`test-reviewer`）の
+合格が要る。それ以外は、自分で見直すセルフレビューで足りる。どちらになるかは、自己申告ではなく
+`python3 tools/tracekit.py change review CHG-NNN` が基準のブランチとの差分から判定する（手順: `verify-and-report`）。
 
 要件が `draft` のあいだは、hook が本番コードの編集を止める。受け入れ条件・担当コンポーネント・検証レベルの3つが
 そろって `approved` になってから、実装に入る。

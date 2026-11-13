@@ -382,6 +382,7 @@ class Project:
         self.prod_files: list[str] = []
         self.test_files: dict[str, str] = {}
         self.test_refs: dict[str, set[tuple[str, str]]] = {}
+        self.test_uses: dict[str, set[str]] = {}  # テストファイル → コードの中で参照しているコンポーネント
         self.owned: dict[str, list[str]] = {cid: [] for cid in self.components}
         self.req_tests: dict[str, dict[str, set[str]]] = {}
         self.ac_tests: dict[tuple[str, str], set[str]] = {}
@@ -576,6 +577,19 @@ class Project:
         except OSError:
             return ""
 
+    def _uses(self, text: str) -> set[str]:
+        """コードの中で参照しているコンポーネント（reference_patterns で判定）。"""
+        found = set()
+        for comp in self.components.values():
+            if not comp.ref_res:
+                continue
+            if comp.ref_combinable:
+                if any(re.search(r.pattern, text, re.M) for r in comp.ref_res):
+                    found.add(comp.id)
+            elif any(r.search(line) for r in comp.ref_res for line in text.split("\n")):
+                found.add(comp.id)
+        return found
+
     def _scan(self) -> None:
         for rel in list_files(self.root):
             if self.is_ignored(rel):
@@ -583,8 +597,10 @@ class Project:
             level = self.test_level(rel)
             if level:
                 self.test_files[rel] = level
-                refs = set(REQ_REF.findall(self.read_text(rel)))
+                text = self.read_text(rel)
+                refs = set(REQ_REF.findall(text))
                 self.test_refs[rel] = refs
+                self.test_uses[rel] = self._uses(text)
                 for rid, ac in refs:
                     self.req_tests.setdefault(rid, {}).setdefault(level, set()).add(rel)
                     if ac:
@@ -743,6 +759,21 @@ def check(proj: Project, matrix: bool = True) -> list[Finding]:
             if dep in comps and comps[dep].ref_res and dep not in used[comp.id]:
                 warn("DEP-UNUSED", f"{comp.id} は {dep} への依存を宣言していますが、参照が見つかりません",
                      "trace/components.toml", f"{comp.id}>{dep}")
+
+    # -- テストが使うコンポーネント ⇔ そのテストが確かめる要件の components
+    #    食い違っていると、そのコンポーネントを変えるときに、要件からたどる影響分析がこのテストを挙げない
+    for test_file, uses in sorted(proj.test_uses.items()):
+        listed = {cid for rid, _ in proj.test_refs.get(test_file, ()) if rid in reqs
+                  for cid in reqs[rid].components}
+        if not listed:
+            continue
+        for cid in sorted(uses - listed):
+            warn("TEST-COMP-UNLISTED",
+                 f"このテストは {cid} の本物を使っていますが、確かめている要件"
+                 f"（{', '.join(sorted({rid for rid, _ in proj.test_refs[test_file]}))}）の components に {cid} が"
+                 "ありません。テストにとってつなぎ目でないなら代用品に替える、つなぎ目なら要件の components に足す、"
+                 "のどちらかにしてください（影響分析は、このテストを挙げるようにしてあります）", test_file,
+                 f"{test_file}>{cid}")
 
     # -- テスト ⇔ 要件
     for test_file, refs in sorted(proj.test_refs.items()):
@@ -997,8 +1028,12 @@ def compute_impact(proj: Project, files=(), components=(), requirements=()) -> d
     def tests_for(req_ids: set[str]) -> set[str]:
         return {t for rid in req_ids for files_ in proj.req_tests.get(rid, {}).values() for t in files_}
 
-    tests_direct = tests_for(direct_reqs) | {t for t in changed_tests if (proj.root / t).is_file()}
-    tests_indirect = tests_for(indirect_reqs) - tests_direct
+    def tests_using(component_ids: set[str]) -> set[str]:  # コードの中でそのコンポーネントを使っているテスト
+        return {t for t, uses in proj.test_uses.items() if uses & component_ids}
+
+    tests_direct = (tests_for(direct_reqs) | tests_using(direct)
+                    | {t for t in changed_tests if (proj.root / t).is_file()})
+    tests_indirect = (tests_for(indirect_reqs) | tests_using(set(dependents))) - tests_direct
     untested = sorted(rid for rid in direct_reqs | indirect_reqs if not proj.req_tests.get(rid))
     return {
         "direct_components": sorted(direct),

@@ -300,6 +300,19 @@ class ImpactTest(ShopCase):
         self.assertEqual(impact["direct_requirements"], ["REQ-001"])
         self.assertEqual(impact["indirect_requirements"], ["REQ-002"])
 
+    def test_tests_that_use_a_component_are_listed_when_it_changes(self):
+        # 結合テストが、要件の components にないコンポーネントの本物を使っていると、要件からたどるだけでは
+        # 「直接」のテストに挙がらなかった（試用での設計レビューの指摘）
+        self.replace("docs/requirements/REQ-002.md",
+                     "components: [COMP-ORDER, COMP-INVENTORY]", "components: [COMP-ORDER]")
+        self.write("tests/unit/test_cancel_rules.py",
+                   '"""REQ-002/AC-1"""\nfrom inventory.service import InventoryService\n')
+        impact = tracekit.compute_impact(self.project(), components=["COMP-INVENTORY"])
+        self.assertIn("tests/unit/test_cancel_rules.py", impact["tests_direct"])
+        found = [f for f in tracekit.check(self.project(), matrix=False) if f.code == "TEST-COMP-UNLISTED"]
+        self.assertEqual([f.where for f in found], ["tests/unit/test_cancel_rules.py"])
+        self.assertIn("COMP-INVENTORY", found[0].message)
+
     def test_quality_base_files_in_the_change_are_called_out(self):
         impact = tracekit.compute_impact(self.project(), files=["trace/gates.toml", "README.md"])
         self.assertEqual(impact["quality_base_files"], ["trace/gates.toml"])

@@ -1617,6 +1617,257 @@ class ReviewTest(GitCase):
         self.assertIn("テスト 未実施", text)
 
 
+@unittest.skipUnless(shutil.which("git"), "git がありません")
+class StagedContentTest(GitCase):
+    """コミット前の検査は、作業ディレクトリの中身を読む。コミットされる中身（ステージ領域）と違えば、
+    確かめたものと、コミットされるものが別になる。違うときは、コミットを拒む。"""
+
+    DEP = "\nfrom order.service import OrderService\n"
+
+    def setUp(self):
+        super().setUp()
+        self.git("checkout", "-q", "-b", "work")
+        self.new_change(components=["COMP-ORDER", "COMP-INVENTORY"], requirements=["REQ-001", "REQ-002"])
+        self.commit("変更記録")
+
+    def test_violation_that_was_staged_and_then_fixed_only_in_the_working_tree_is_not_committed(self):
+        # 第6回レビューで再現された手順: 違反をステージ → 作業ディレクトリだけ元に戻す → コミット
+        original = (self.root / "src/inventory/stock.py").read_text(encoding="utf-8")
+        self.append("src/inventory/stock.py", self.DEP)
+        self.git("add", "src/inventory/stock.py")
+        self.write("src/inventory/stock.py", original)
+        self.assertEqual(self.cli("check", "--no-matrix"), 0)  # 作業ディレクトリだけを見れば、問題はない
+        code, text = self.cli_text("guard", "--staged")
+        self.assertEqual(code, 1)
+        self.assertIn("src/inventory/stock.py", text)
+        self.assertIn("ステージ", text)
+        self.git("add", "src/inventory/stock.py")  # ステージし直せば、確かめたものとコミットされるものが揃う
+        self.assertEqual(self.cli("guard", "--staged"), 0)
+
+    def test_ledger_or_test_left_out_of_the_commit_is_noticed(self):
+        # コードだけをステージし、それを正当化する台帳の変更や、新しいテストを入れ忘れる
+        self.append("src/inventory/stock.py", "\n# 変更\n")
+        self.git("add", "src/inventory/stock.py")
+        self.assertEqual(self.cli("guard", "--staged"), 0)
+        self.append("trace/components.toml", "\n# 台帳の変更（未ステージ）\n")
+        code, text = self.cli_text("guard", "--staged")
+        self.assertEqual(code, 1)
+        self.assertIn("trace/components.toml", text)
+        self.git("checkout", "--", "trace/components.toml")
+        self.write("tests/unit/test_new.py", '"""REQ-001/AC-1"""\n')
+        code, text = self.cli_text("guard", "--staged")
+        self.assertEqual(code, 1)
+        self.assertIn("tests/unit/test_new.py", text)
+
+    def test_unrelated_files_may_stay_out_of_the_commit(self):
+        self.append("src/inventory/stock.py", "\n# 変更\n")
+        self.git("add", "src/inventory/stock.py")
+        self.append("README.md", "\nメモ\n")              # 検査が読まないファイル
+        self.write("notes/todo.md", "あとでやること\n")
+        self.assertEqual(self.cli("guard", "--staged"), 0)
+
+    def test_commit_of_documents_alone_is_not_held_up_by_unfinished_code(self):
+        self.append("src/inventory/stock.py", "\n# 書きかけ\n")
+        self.append("README.md", "\nメモ\n")
+        self.git("add", "README.md")
+        self.assertEqual(self.cli("guard", "--staged"), 0)
+
+    def test_commit_hook_refuses_the_commit(self):
+        shutil.copytree(REPO / "tools", self.root / "tools", ignore=shutil.ignore_patterns("__pycache__", "tests"))
+        (self.root / "tools" / "git-hooks" / "pre-commit").chmod(0o755)
+        self.approved_change("tools/**")
+        self.git("add", "-A")
+        self.git("commit", "-q", "--no-verify", "-m", "tools")
+        self.git("config", "core.hooksPath", "tools/git-hooks")
+        original = (self.root / "src/inventory/stock.py").read_text(encoding="utf-8")
+        self.append("src/inventory/stock.py", self.DEP)
+        self.git("add", "src/inventory/stock.py")
+        self.write("src/inventory/stock.py", original)
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            self.git("commit", "-q", "-m", "違反が入ったままのコミット")
+        self.assertIn("ステージ", (caught.exception.stdout + caught.exception.stderr).decode("utf-8", "replace"))
+
+
+@unittest.skipUnless(shutil.which("git"), "git がありません")
+class RebuildTest(GitCase):
+    """アーキテクチャの再構築（kind: rebuild）。利用者が承認した再構築のあいだだけ、途中のコミットで
+    構造の不整合を許容する。変更の範囲・品質基盤の保護・完了の条件は、緩めない。"""
+
+    DEP = "\nfrom order.service import OrderService\n"
+
+    def setUp(self):
+        super().setUp()
+        self.git("checkout", "-q", "-b", "work")
+
+    def rebuild(self, components=("COMP-ORDER", "COMP-INVENTORY"), requirements=("REQ-001", "REQ-002"),
+                approved_by="山田", quality_base=()):
+        path = tracekit.change_new(self.project(), "注文と在庫の再構築", "rebuild", list(components),
+                                   list(requirements), quality_base=list(quality_base), approved_by=approved_by)
+        return path, tracekit.split_frontmatter(path.read_text(encoding="utf-8"))[0]["id"]
+
+    def save(self):
+        """途中の保存（コミット前の検査と同じ2つ）。(終了コードの合計, 出力) を返す。"""
+        self.git("add", "-A")
+        guard, guard_text = self.cli_text("guard", "--staged")
+        check, check_text = self.cli_text("check", "--no-matrix", "--in-progress")
+        return guard + check, guard_text + check_text
+
+    def break_structure(self, what):
+        if what == "undeclared":
+            self.append("src/inventory/stock.py", self.DEP)
+        elif what == "orphan":
+            self.write("src/billing/invoice.py", "TOTAL = 0\n")
+        elif what == "untested":
+            (self.root / "tests/unit/test_stock.py").unlink()
+
+    def test_structure_may_be_inconsistent_between_commits_of_an_approved_rebuild(self):
+        self.rebuild()
+        for what, code in (("undeclared", "DEP-UNDECLARED"), ("orphan", "CODE-ORPHAN"), ("untested", "REQ-LEVEL-MISSING")):
+            with self.subTest(what=what):
+                self.break_structure(what)
+                result, text = self.save()
+                self.assertEqual(result, 0, text)
+                self.assertIn(code, text)   # 許容した不整合は、黙らずに挙げる
+                self.assertIn("ALLOW", text)
+                self.assertIn("CHG-002", text)
+
+    def test_same_states_are_refused_in_ordinary_work(self):
+        for what in ("undeclared", "orphan", "untested"):
+            with self.subTest(what=what):
+                self.new_change(components=["COMP-ORDER", "COMP-INVENTORY"], requirements=["REQ-001", "REQ-002"],
+                                kind="refactor")
+                self.break_structure(what)
+                result, text = self.save()
+                self.assertNotEqual(result, 0)
+                self.assertNotIn("ALLOW", text)
+                self.git("reset", "-q", "--hard")
+                self.git("clean", "-qfd")
+
+    def test_rebuild_that_nobody_approved_allows_nothing(self):
+        self.rebuild(approved_by="")
+        self.assertIn("CHG-AWAITING-APPROVAL", self.codes("warning", matrix=False))
+        self.break_structure("orphan")
+        result, text = self.save()
+        self.assertNotEqual(result, 0)
+        self.assertNotIn("ALLOW", text)
+
+    def test_finished_rebuild_must_name_who_approved_it(self):
+        path, _ = self.rebuild(approved_by="")
+        self.replace("docs/changes/CHG-002.md", "status: active", "status: done")
+        self.assertIn("CHG-NO-APPROVER", self.codes(matrix=False))
+
+    def test_rebuild_does_not_widen_what_may_be_edited(self):
+        self.rebuild(components=["COMP-ORDER"])
+        self.append("src/inventory/stock.py", "\n# 範囲の外\n")
+        result, text = self.save()
+        self.assertNotEqual(result, 0)
+        self.assertIn("src/inventory/stock.py", text)
+
+    def test_tolerance_covers_only_the_components_being_rebuilt(self):
+        # 再構築と並行して進めている普通の変更は、いままでどおり厳格に調べる
+        self.rebuild(components=["COMP-ORDER"])
+        self.new_change(components=["COMP-INVENTORY"], kind="refactor")
+        self.break_structure("undeclared")  # 在庫管理（再構築の範囲の外）に、未宣言の依存
+        result, text = self.save()
+        self.assertNotEqual(result, 0)
+        self.assertIn("ERROR DEP-UNDECLARED", text)
+
+    def test_rebuild_does_not_open_the_quality_base(self):
+        self.rebuild()
+        self.replace("trace/gates.toml",
+                     'cmd = "PYTHONPATH=src python3 -m unittest discover -s tests/unit -q"', 'cmd = "true"')
+        result, text = self.save()
+        self.assertNotEqual(result, 0)
+        self.assertIn("trace/gates.toml", text)
+
+    def test_finished_change_records_stay_protected_during_a_rebuild(self):
+        self.rebuild()
+        self.append("docs/changes/CHG-001.md", "\n書き換え\n")
+        result, text = self.save()
+        self.assertNotEqual(result, 0)
+        self.assertIn("CHG-001", text)
+
+    def test_strict_checks_and_completion_do_not_change(self):
+        path, change_id = self.rebuild()
+        self.break_structure("undeclared")
+        self.fill(path)
+        self.assertEqual(self.save()[0], 0)
+        self.assertEqual(self.cli("check", "--no-matrix"), 1)              # ふつうの検査は、不整合をエラーにする
+        self.assertEqual(self.cli("guard", "--base", "main", "--strict"), 0)
+        self.break_structure("orphan")
+        self.assertEqual(self.cli("guard", "--base", "main"), 1)           # 取り込みの前（プルリクエスト）は、許容しない
+        _, ok = verify.run_gates(self.root, echo=lambda _: None)
+        self.assertFalse(ok)                                               # 品質ゲートは、不合格
+        log = []
+        self.assertFalse(tracekit.change_close(self.project(), change_id, echo=log.append))
+        self.assertEqual(self.project().changes[change_id].status, "active")
+
+    def test_rebuild_always_needs_independent_design_and_test_reviews(self):
+        path, change_id = self.rebuild()
+        project = self.project()
+        with tracekit.snapshot(self.root, tracekit.base_revision(project)) as base:
+            needs = tracekit.review_needs(project, base, project.changes[change_id])
+        self.assertIn("再構築", " ".join(needs["design_review"]))
+        self.assertIn("再構築", " ".join(needs["test_review"]))
+        self.fill(path, design="self", test="self")
+        self.assertFalse(tracekit.change_close(self.project(), change_id, echo=lambda _: None))
+        self.set_reviews(path, "passed", "passed")
+        self.assertTrue(tracekit.change_close(self.project(), change_id, echo=lambda _: None))
+
+    def test_status_tells_what_is_being_tolerated(self):
+        self.rebuild()
+        self.break_structure("orphan")
+        text = tracekit.render_status(self.project())
+        self.assertIn("再構築", text)
+        self.assertIn("許容", text)
+
+    def run_hook(self, name, payload):
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.root))
+        return subprocess.run([sys.executable, str(HOOKS / name)], input=json.dumps(payload),
+                              capture_output=True, text=True, env=env, encoding="utf-8")
+
+    def test_hooks_let_a_rebuild_go_on_and_keep_stopping_ordinary_work(self):
+        new_place = {"hook_event_name": "PreToolUse", "tool_name": "Write", "cwd": str(self.root),
+                     "tool_input": {"file_path": str(self.root / "src/billing/invoice.py"), "content": "TOTAL = 0\n"}}
+        stop = {"hook_event_name": "Stop", "stop_hook_active": False, "cwd": str(self.root)}
+        self.assertEqual(self.run_hook("pre_edit.py", new_place).returncode, 2)   # ふつうは、台帳にない場所には書けない
+        self.rebuild()
+        self.assertEqual(self.run_hook("pre_edit.py", new_place).returncode, 0)
+        self.break_structure("orphan")
+        self.break_structure("undeclared")
+        done = self.run_hook("on_stop.py", stop)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("CODE-ORPHAN", done.stdout)   # 止めないが、許容している不整合を知らせる
+        self.assertIn("DEP-UNDECLARED", done.stdout)
+        self.replace("docs/changes/CHG-002.md", "approved_by: 山田", "approved_by:")
+        self.assertEqual(self.run_hook("on_stop.py", stop).returncode, 2)
+
+    def test_approving_a_rebuild_makes_claude_code_ask_the_person(self):
+        self.rebuild(approved_by="")
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": str(self.root),
+                   "tool_input": {"file_path": str(self.root / "docs/changes/CHG-002.md"),
+                                  "old_string": "approved_by:", "new_string": "approved_by: 山田"}}
+        done = self.run_hook("pre_edit.py", payload)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = json.loads(done.stdout)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "ask")
+        self.assertIn("再構築", out["permissionDecisionReason"])
+
+    def test_commit_hook_saves_the_unfinished_state_of_a_rebuild(self):
+        shutil.copytree(REPO / "tools", self.root / "tools", ignore=shutil.ignore_patterns("__pycache__", "tests"))
+        (self.root / "tools" / "git-hooks" / "pre-commit").chmod(0o755)
+        self.approved_change("tools/**")
+        self.git("add", "-A")
+        self.git("commit", "-q", "--no-verify", "-m", "tools")
+        self.git("config", "core.hooksPath", "tools/git-hooks")
+        self.rebuild()
+        for what in ("undeclared", "orphan", "untested"):
+            self.break_structure(what)
+        self.append("src/order/service.py", "\ndef broken(:\n")   # 構文も壊れている
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "再構築の途中")   # コミット前の検査を通る（落ちれば例外）
+
+
 class AdapterExamplesTest(unittest.TestCase):
     def test_every_toml_example_can_be_pasted_as_it_is(self):
         text = (REPO / "adapters" / "README.md").read_text(encoding="utf-8")

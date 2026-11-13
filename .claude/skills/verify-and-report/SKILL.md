@@ -98,6 +98,11 @@ description: 実装が済んだあと、完了と報告する前に必ず使う�
   要る水準を下げるために、変更記録の範囲（`components`・`requirements`・`quality_base`）から対象を外さない
   （範囲の外の変更は、hook とコミット前の検査が止める）。「比べられないため、重要度を判定できません」と出たら、
   基準のブランチ（`trace/config.toml` の `base_branch`）があるかを `python3 tools/tracekit.py doctor` で確かめる。
+- **コミットが「ステージした内容と、作業ディレクトリの内容が違います」で止まる**: 検査は作業ディレクトリを読むので、
+  そのままでは確かめていない内容がコミットされる。コミットに入れるものを `git add` し直す。`--no-verify` で通さない。
+- **再構築（`kind: rebuild`）を完了にできない**: 途中の保存で許容されていた不整合は、完了のときはすべてエラーになる。
+  `python3 tools/tracekit.py check`（`--in-progress` なし）のエラーを解消する。解消しきれないなら、完了にせず、
+  残っている不整合と見通しを報告する。完了にするために、ゲートや検査を緩めない。
 - **UNSET**（未設定のゲート）: そのゲートを、このプロジェクトでどう実行するかが決まっていない。コマンドを設定する（`adapters/README.md`）。実行しないと決めるのは利用者で、自分では決めない。`required = true` のゲートは外せない。利用者が承認したら、区分を `skip_kind` に（確かめる対象がないなら `not_applicable`、対象はあるが一時的に外すなら `waiver`）、理由を `skip_reason` に、承認した人の名前を `skip_approved_by` に書く。`waiver` には期限 `skip_until` が必須。
 - **承認した人のない SKIP・期限を過ぎた SKIP の FAIL**: 自分で名前を埋めたり、期限を延ばしたりしない。利用者に、ゲートを設定するか、承認を取り直すかを確認する。
 - **ゲートの設定（`trace/gates.toml`）を変える必要が出た**: 品質基盤の変更になる。利用者の承認を得て、変更記録の `quality_base` と `approved_by` に記録する（`.claude/skills/analyze-impact/SKILL.md` の「品質基盤を変えるとき」）。

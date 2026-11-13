@@ -10,6 +10,9 @@
    pre_edit hook は Edit / Write しか見ないので、シェルのコマンドやスクリプトで書き換えた変更は、ここで見つける。
 3. 基準のブランチと比べて、承認されていない後退（要件・受け入れ条件・テストの喪失など）がないか。
 
+利用者が承認したアーキテクチャの再構築（kind: rebuild）が進行中なら、その範囲の構造の不整合と、一時的な
+テスト・要件の欠落では止めない（途中の保存と同じ扱い）。止めなかったものは、知らせる。
+
 同じ指摘で止め続けないよう、止めるのは1回だけ（stop_hook_active のときは通す）。
 この hook が内部エラーで終わったときも、1回は止める（守りが黙って外れないようにする）。
 """
@@ -51,16 +54,29 @@ def main(data: dict) -> int:
         print(f"台帳を読めません。直してから終了してください: {exc}", file=sys.stderr)
         return 2
     errors = [f for f in findings if f.level == "error"]
-    outside, lost, notes, approvals = [], [], [], []
+    outside, lost, notes, approvals, allowed = [], [], [], [], []
+    rebuild_aware = hasattr(tracekit, "split_tolerated")  # 検査ツールが古い版（別のブランチの worktree）なら、厳格なまま
+    if rebuild_aware:
+        errors, tolerated = tracekit.split_tolerated(project, errors)
+        allowed = [f"{finding.code}: {finding.message} [{finding.where}]（{change.id}）" for finding, change in tolerated]
     rev = tracekit.base_revision(project)  # 基準のブランチがなければ None（直前のコミットとだけ比べる）
     try:
         changed = tracekit.git_changed(root, base=rev)
         with tracekit.snapshot(root, rev) as base:
             # 要件の変更は、変更記録を作る前の工程で行うことがあるので、ここでは見ない（コミット前に見る）
+            extra, kept = [], {"in_progress": True, "tolerated": []} if rebuild_aware else {}
             outside = tracekit.guard(project, changed, diff_files=changed, check_requirements=False,
-                                     base_rev=rev or "HEAD", base=base)
+                                     base_rev=rev or "HEAD", base=base, **kept)
             report = tracekit.regress(project, base)
-        lost = [item for item in report["items"] if item["blocks"]]
+            for item in report["items"]:
+                if not item["blocks"]:
+                    continue
+                change = tracekit.regress_tolerated(project, base, item["id"]) if rebuild_aware else None
+                if change is None:
+                    lost.append(item)
+                else:
+                    extra.append(f"{item['id']}: {item['what']}（{change.id}）")
+            allowed += [f"{rel}: {message}" for rel, message in kept.get("tolerated", [])] + extra
         if report["broken"]:
             lost.append({"id": "比較の基準", "what": report["reason"]})
         notes, approvals = report["notes"], report["approvals"]
@@ -68,6 +84,11 @@ def main(data: dict) -> int:
         pass  # git の管理下にない、最初のコミットがまだない、など。コミット前の検査に任せる
     if not errors and not outside and not lost:
         # 止めないが、エージェントが報告に含められるように知らせる（利用者は、これを読んで取り込むかを決める）
+        if allowed:
+            print(f"再構築の途中として許容している不整合が {len(allowed)} 件あります。未完成の状態です"
+                  "（完了・取り込みの前に、すべて解消すること。報告では「完了していない」と伝えること）:\n  "
+                  + "\n  ".join(allowed[:MAX_SHOWN])
+                  + (f"\n  …ほか {len(allowed) - MAX_SHOWN} 件" if len(allowed) > MAX_SHOWN else ""))
         if notes:
             print("確かめてほしい点（python3 tools/tracekit.py regress）:\n  " + "\n  ".join(notes[:MAX_SHOWN]))
         if approvals:

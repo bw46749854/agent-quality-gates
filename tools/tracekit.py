@@ -47,7 +47,16 @@ AC_LIKE = re.compile(r"^[ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?[*_]*(AC-\d+)[*_]*[ \t
 
 REQ_STATUSES = ("draft", "approved", "implemented", "deprecated")
 CHG_STATUSES = ("active", "done", "abandoned")
-CHG_KINDS = ("feature", "fix", "refactor", "chore")
+CHG_KINDS = ("feature", "fix", "refactor", "chore", "rebuild")
+# アーキテクチャの再構築（kind: rebuild）を利用者が承認しているあいだ、途中の保存（編集・コミット・作業の終わり）で
+# 許容する不整合。責務の境界と依存を組み替える途中では、台帳・コード・テストの対応が一時的に崩れる。
+# 許容するのは構造の不整合だけ。書式の誤り、変更の範囲、品質基盤の保護は、再構築中も変わらない。
+# 完了（change close）と品質ゲート（verify.py）は、ここにあるものも含めて、すべてエラーとして扱う。
+REBUILD_TOLERATED = {
+    "CODE-ORPHAN", "COMP-OVERLAP", "DEP-UNDECLARED", "COMP-CYCLE", "COMP-DEP-UNKNOWN",   # コンポーネントと依存
+    "REQ-COMP-UNKNOWN", "REQ-AC-UNTESTED", "REQ-LEVEL-MISSING", "REQ-NO-CODE", "TEST-DANGLING",  # 要件とテストの対応
+    "CHG-REF-UNKNOWN",                                                                    # 組み替えで消えた ID への参照
+}
 REQ_KEYS = {"id", "title", "status", "priority", "components", "verify"}
 CHG_KEYS = {"id", "title", "status", "kind", "requirements", "components",
             "quality_base", "accepts", "approved_by", "design_review", "test_review"}
@@ -179,6 +188,11 @@ class Change:
     accepts: list[str] = field(default_factory=list)       # 受け入れる後退（要件・受け入れ条件・テスト・警告の ID）
     approved_by: str = ""                                   # quality_base と accepts を承認した人
     reviews: dict[str, str] = field(default_factory=dict)   # レビューの結果（REVIEWS のキー → REVIEW_STATES）。書かれた項目だけ
+
+    @property
+    def needs_approval(self) -> bool:
+        """人の承認（approved_by）が要る変更記録か。品質基盤の変更、後退の受け入れ、アーキテクチャの再構築。"""
+        return bool(self.quality_base or self.accepts or self.kind == "rebuild")
 
     def review(self, key: str) -> str:
         """レビューの状態。項目がない・空なら、未実施（pending）として扱う。"""
@@ -893,15 +907,16 @@ def check(proj: Project, matrix: bool = True) -> list[Finding]:
         if (change.kind in ("feature", "fix") and change.status != "abandoned"
                 and not change.requirements):
             err("CHG-NO-REQ", f"{change.id}: kind が {change.kind} の変更には、対象の要件が必要です", change.path)
-        if (change.quality_base or change.accepts) and not change.approved_by and change.status == "active":
-            # 承認を待っている記録。承認した人が書かれるまで何も通さないので、残しておいてよい
-            warn("CHG-AWAITING-APPROVAL", f"{change.id}: 承認待ちです（quality_base・accepts はあるが、approved_by が"
-                 "ない）。承認されるまで、この記録はどの変更も通しません。承認を得たら approved_by を書きます",
-                 change.path, change.id)
-        elif (change.quality_base or change.accepts) and not change.approved_by and change.status == "done":
-            err("CHG-NO-APPROVER", f"{change.id}: 品質基盤の変更（quality_base）か、後退の受け入れ（accepts）を"
-                "書いていますが、承認した人（approved_by）が書かれていません。利用者に説明して承認を得てから、"
-                "その人の名前を書いてください（承認が得られないなら、quality_base・accepts を消して、変更をやめます）",
+        if change.needs_approval and not change.approved_by and change.status == "active":
+            # 承認を待っている記録。承認した人が書かれるまで、承認の要ることは何も通さないので、残しておいてよい
+            warn("CHG-AWAITING-APPROVAL", f"{change.id}: 承認待ちです（quality_base・accepts・kind: rebuild のどれかが"
+                 "あるが、approved_by がない）。承認されるまで、品質基盤の変更・後退の受け入れ・再構築の途中の不整合の"
+                 "許容は、どれも働きません。承認を得たら approved_by を書きます", change.path, change.id)
+        elif change.needs_approval and not change.approved_by and change.status == "done":
+            err("CHG-NO-APPROVER", f"{change.id}: 品質基盤の変更（quality_base）、後退の受け入れ（accepts）、"
+                "アーキテクチャの再構築（kind: rebuild）のどれかですが、承認した人（approved_by）が書かれていません。"
+                "利用者に説明して承認を得てから、その人の名前を書いてください"
+                "（承認が得られないなら、quality_base・accepts を消すか kind を変えて、変更をやめます）",
                 change.path)
         if change.status == "done":
             # レビューの項目がない完了済みの記録（この項目ができる前のもの）は、そのまま認める
@@ -1181,6 +1196,38 @@ def quality_guarded(proj: "Project", rev: str = "HEAD") -> bool:
     return bool(proj.components) if committed is None else committed
 
 
+def _git_names(root: Path, *args: str) -> list[str]:
+    # -z: 日本語などのファイル名を、エスケープされていない形で受け取る
+    return [name for name in _git(root, *args, "-z").split("\0") if name]
+
+
+def staged_mismatch(proj: "Project") -> list[str]:
+    """検査が読むファイルのうち、コミットされる中身（ステージ領域）と作業ディレクトリの中身が違うもの。
+
+    コミット前の検査は、作業ディレクトリのファイルを読む。違反をステージしたあと作業ディレクトリだけを直す、
+    コードだけをステージして台帳や新しいテストを入れ忘れる、といった状態では、確かめたものと、
+    コミットされるものが別になる（検査は通り、違反がコミットされる）。違うものがあれば、コミットを拒む。
+
+    見るのは、検査が読むファイルだけ（台帳、要件、変更記録、本番コード、テスト）。メモや文書は、
+    コミットに入れなくてよい。検査が読むファイルを1つもステージしていないコミットでは、何も挙げない
+    （その場合、検査が読むファイルについては、コミットの中身は前のコミットと同じだから）。
+    """
+    folders = tuple(str(proj.cfg[key]).strip("/") + "/" for key in ("requirements_dir", "changes_dir"))
+
+    def inspected(rel: str) -> bool:
+        return not proj.is_ignored(rel) and (rel.startswith(("trace/", *folders)) or proj.in_source_root(rel)
+                                             or proj.test_level(rel) is not None)
+
+    try:
+        if not any(inspected(rel) for rel in _git_names(proj.root, "diff", "--name-only", "--cached", "--relative")):
+            return []
+        differing = (_git_names(proj.root, "diff", "--name-only", "--relative")          # ステージしたあとで変えた・消した
+                     + _git_names(proj.root, "ls-files", "--others", "--exclude-standard"))  # git に足していない
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ConfigError(f"git の差分を取得できません: {exc}") from exc
+    return sorted({rel for rel in differing if inspected(rel)})
+
+
 def git_changed(root: Path, base: str | None = None, staged: bool = False) -> list[str]:
     """変更されたファイル（ルートからの相対パス）。
 
@@ -1188,8 +1235,7 @@ def git_changed(root: Path, base: str | None = None, staged: bool = False) -> li
     いても、その変更をこちらの変更として数えない（CI で `origin/main` を指定する場合のため）。
     """
     def names(*args: str) -> list[str]:
-        # -z: 日本語などのファイル名を、エスケープされていない形で受け取る
-        return [name for name in _git(root, *args, "-z").split("\0") if name]
+        return _git_names(root, *args)
 
     try:
         if staged:
@@ -1492,11 +1538,76 @@ def render_regress(report: dict, base_name: str = "変更する前") -> str:
     return "\n".join(out) + "\n"
 
 
+# --------------------------------------------------------------------------- 再構築の途中の許容
+
+def rebuilds(proj: Project) -> list[Change]:
+    """進行中で、利用者が承認した、アーキテクチャの再構築の変更記録。"""
+    return [c for c in proj.changes.values() if c.status == "active" and c.kind == "rebuild" and c.approved_by]
+
+
+def tolerated_by(proj: Project, finding: Finding) -> Change | None:
+    """この不整合を、途中の状態として許容する再構築の変更記録。許容しないなら None。
+
+    許容するのは、構造の不整合（REBUILD_TOLERATED）で、その再構築の範囲の中にあるものだけ。
+    範囲は、変更記録の components と requirements で決める。並行して進めている普通の変更が作った不整合や、
+    範囲の外のコンポーネントの不整合は、再構築中でも許容しない。
+    """
+    if finding.level != "error" or finding.code not in REBUILD_TOLERATED:
+        return None
+    rel = re.sub(r":\d+\Z", "", finding.where)
+    requirement = next((r for r in proj.requirements.values() if r.path == rel), None)
+    for change in rebuilds(proj):
+        scope, reqs = set(change.components), set(change.requirements)
+        if rel in proj.test_files:      # テスト: 確かめている要件が、再構築の範囲にある
+            inside = bool({rid for rid, _ in proj.test_refs.get(rel, ())} & reqs)
+        elif proj.in_source_root(rel):  # 本番コード: まだどのコンポーネントにも属さないか、範囲のコンポーネントのもの
+            owners = proj.owners(rel)
+            inside = not owners or any(o.id in scope for o in owners)
+        elif requirement is not None:   # 要件: 範囲の要件か、範囲のコンポーネントが担う要件
+            inside = requirement.id in reqs or bool(scope & set(requirement.components))
+        elif rel in {c.path for c in proj.changes.values()}:
+            inside = rel == change.path
+        else:                           # 台帳そのもの（変えるには、別に承認が要る）
+            inside = True
+        if inside:
+            return change
+    return None
+
+
+def split_tolerated(proj: Project, findings: list[Finding]) -> tuple[list[Finding], list[tuple[Finding, Change]]]:
+    """検査の結果を、(そのまま扱うもの, 再構築の途中として許容するものと、その変更記録) に分ける。"""
+    kept, allowed = [], []
+    for finding in findings:
+        change = tolerated_by(proj, finding)
+        if change is None:
+            kept.append(finding)
+        else:
+            allowed.append((finding, change))
+    return kept, allowed
+
+
+def regress_tolerated(proj: Project, base: Project | None, item_id: str) -> Change | None:
+    """後退（regress の items の1件）を、途中の状態として許容する再構築の変更記録。許容しないなら None。
+
+    再構築の途中では、テストを消して書き直す、要件を分け直す、といった一時的な欠落が起きる。
+    途中の保存では許容するが、完了のときの後退の検出（基準のブランチとの比較）は、いつもどおり働く。
+    完了済みの変更記録（履歴）の書き換え・削除は、再構築とは関係がないので、許容しない。
+    """
+    if CHG_ID.match(item_id):
+        return None
+    requirement_ids = set(re.findall(r"REQ-\d{3,}", item_id))
+    if base is not None:
+        requirement_ids |= {rid for rid, _ in base.test_refs.get(item_id, ())}
+    return next((c for c in rebuilds(proj)
+                 if not requirement_ids or requirement_ids & set(c.requirements)), None)
+
+
 # --------------------------------------------------------------------------- 変更の範囲の番人
 
 def guard(proj: Project, files, diff_files=None, strict: bool = False,
           check_requirements: bool | None = None, base_rev: str = "HEAD",
-          base: Project | None = None) -> list[tuple[str, str]]:
+          base: Project | None = None, in_progress: bool | None = None,
+          tolerated: list | None = None) -> list[tuple[str, str]]:
     """変更が、影響分析済みの変更記録の範囲に入っているかを調べる。
 
     - diff_files なし（編集の時点。hook）: 進行中の変更記録だけが有効。
@@ -1519,7 +1630,15 @@ def guard(proj: Project, files, diff_files=None, strict: bool = False,
 
     base（変更する前のプロジェクト。snapshot で得る）を渡すと、要件とテストを「変更する前の状態」でも見る。
     要件を draft に戻してから書き換える、要件やテストのファイルごと消す、といった変更を見逃さないため。
+
+    in_progress（途中の保存: 編集の時点、コミット前、作業の終わり。既定では、編集の時点だけ）では、承認された
+    再構築（rebuilds）が進行中なら、まだどのコンポーネントにも属さない場所の本番コードを止めない
+    （新しい構成のコードを、台帳に書く前に置けるようにする）。止めなかったものは tolerated に足す。
+    範囲の外のコンポーネント、要件、既存のテスト、品質基盤についての規則は、再構築中も同じ。
     """
+    if in_progress is None:
+        in_progress = diff_files is None
+    rebuilding = rebuilds(proj) if in_progress else []
     changed = set(diff_files or ())
     if check_requirements is None:
         check_requirements = diff_files is not None
@@ -1573,7 +1692,11 @@ def guard(proj: Project, files, diff_files=None, strict: bool = False,
                                   "担当コンポーネント（components）・検証レベル（verify）を埋めて approved に"
                                   "してから実装に入ってください（手順: .claude/skills/develop/SKILL.md）"))
             continue
-        if not owners:
+        if not owners and rebuilding:
+            if tolerated is not None:
+                tolerated.append((rel, f"まだどのコンポーネントにも属さない場所です（再構築 {rebuilding[0].id} の途中として"
+                                       "許容。完了までに、trace/components.toml のコンポーネントに入れる）"))
+        elif not owners:
             problems.append((rel, "どのコンポーネントにも属さない場所です。新しい責務なら、先に設計として "
                                   "trace/components.toml にコンポーネント（paths・責務・依存先）を宣言してください"
                                   "（手順: .claude/skills/design-architecture/SKILL.md）"))
@@ -1674,9 +1797,9 @@ def change_new(proj: Project, title: str, kind: str, components: list[str],
     if kind in ("feature", "fix") and not requirements:
         problems.append(f"kind が {kind} の変更には --requirements が必要です")
     approved_by = " ".join(approved_by.split())
-    if approved_by and not (quality_base or accepts):
-        problems.append("承認した人（approved_by）は、品質基盤の変更（quality_base）か、後退の受け入れ（accepts）と"
-                        "一緒に書きます")
+    if approved_by and not (quality_base or accepts or kind == "rebuild"):
+        problems.append("承認した人（approved_by）は、品質基盤の変更（quality_base）、後退の受け入れ（accepts）、"
+                        "アーキテクチャの再構築（kind: rebuild）のどれかと一緒に書きます")
     if problems:
         raise ConfigError("変更記録を作れません: " + " / ".join(problems))
     numbers = [int(cid.split("-")[1]) for cid in proj.changes]
@@ -1697,7 +1820,7 @@ def change_new(proj: Project, title: str, kind: str, components: list[str],
             f"quality_base: [{', '.join(quality_base)}]\n" if quality_base else "",
             f"accepts: [{', '.join(accepts)}]\n" if accepts else "",
             # 承認した人は、承認を得てから書く（Claude Code では、書くときに利用者へ確認のダイアログが出る）
-            f"approved_by: {approved_by}\n" if quality_base or accepts else ""]),
+            f"approved_by: {approved_by}\n" if quality_base or accepts or kind == "rebuild" else ""]),
         impact=render_impact(proj, impact)), encoding="utf-8")
     return path
 
@@ -1728,6 +1851,12 @@ def review_needs(proj: Project, base: Project | None, change: Change) -> dict[st
                "（git の管理下にない、基準のブランチがない、最初のコミットの前、のどれかです）")
         return {key: [why] for key in REVIEWS}
     needs: dict[str, list[str]] = {key: [] for key in REVIEWS}
+    if change.kind == "rebuild":
+        # 途中の検査を緩めた分、できあがった構造は、実装した本人とは別の目で確かめる
+        needs["design_review"].append("アーキテクチャの再構築（kind: rebuild）: 到達した構造が、目標とした責務の境界・"
+                                      "依存の向きになっているかを確かめる")
+        needs["test_review"].append("アーキテクチャの再構築（kind: rebuild）: 維持すると決めた振る舞いを、"
+                                    "組み替えたあとのテストが確かめ続けているかを確かめる")
 
     # -- 設計: コンポーネントの台帳の差分
     ledger = _covers(change, "trace/components.toml")
@@ -1874,9 +2003,9 @@ def change_close(proj: Project, change_id: str, echo=print) -> bool:
         content = re.sub(r"<!--.*?-->", "", sections.get(name, ""), flags=re.S).strip()
         if not content:
             problems.append(f"「{name}」が書かれていません")
-    if (change.quality_base or change.accepts) and not change.approved_by:
-        problems.append("承認待ちです（quality_base・accepts はあるが、approved_by がない）。承認を得て approved_by を"
-                        "書くか、承認が得られないなら quality_base・accepts を消してください")
+    if change.needs_approval and not change.approved_by:
+        problems.append("承認待ちです（quality_base・accepts・kind: rebuild のどれかがあるが、approved_by がない）。"
+                        "承認を得て approved_by を書くか、承認が得られないなら、それらを消してください")
     for rid in change.requirements:
         req = proj.requirements.get(rid)
         if req is not None and req.status not in ("implemented", "deprecated"):
@@ -1937,6 +2066,10 @@ def render_status(proj: Project) -> str:
         f"- 台帳の検査: エラー {errors} 件、警告 {warnings} 件"
         + ("（`python3 tools/tracekit.py check` で内容を確認して直す）" if errors else ""),
     ]
+    for change in rebuilds(proj):
+        allowed = [f for f, by in split_tolerated(proj, findings)[1] if by.id == change.id]
+        out.append(f"- 再構築中: {change.id}（承認: {change.approved_by}）。途中の保存では、範囲の中の構造の不整合を"
+                   f"許容します（いま {len(allowed)} 件。`check --in-progress` で一覧）。完了（change close）までに、すべて解消すること")
     active = [c for c in proj.changes.values() if c.status == "active"]
     if active:
         out.append("- 進行中の変更:")
@@ -2273,6 +2406,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("check", help="台帳・コード・テストの整合を検査する")
     p.add_argument("--no-matrix", action="store_true", help="マトリクスの鮮度は調べない")
     p.add_argument("--all", action="store_true", help="同じ種類の警告を省略せず、すべて表示する")
+    p.add_argument("--in-progress", action="store_true",
+                   help="途中の保存として調べる（コミット前の検査が使う）。承認された再構築（kind: rebuild）が進行中なら、"
+                        "その範囲の構造の不整合を、許容したものとして表示し、不合格にしない")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("impact", help="変更の影響範囲と、実行すべきテストを抽出する")
@@ -2337,6 +2473,14 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "check":
             findings = check(proj, matrix=not args.no_matrix)
+            if args.in_progress:
+                findings, allowed = split_tolerated(proj, findings)
+                for finding, change in allowed:
+                    print(f"ALLOW {finding.code}: {finding.message}" + (f" [{finding.where}]" if finding.where else "")
+                          + f"（再構築 {change.id} の途中として許容）")
+                if allowed:
+                    print(f"再構築の途中として許容した不整合: {len(allowed)} 件"
+                          "（完了のときは、どれもエラーです。change close までに解消してください）")
             if args.json:
                 print(json.dumps([f.__dict__ for f in findings], ensure_ascii=False, indent=2))
             else:
@@ -2383,12 +2527,34 @@ def main(argv: list[str] | None = None) -> int:
             if args.strict and diff_files is None:
                 raise ConfigError("--strict は --base か --staged と一緒に使います")
             base_rev = diff_start(proj.root, args.base) if args.base and not args.staged else "HEAD"
+            if args.staged:
+                # 確かめるもの（作業ディレクトリ）と、コミットされるもの（ステージ領域）が違えば、ほかの結果は当てにならない
+                differing = staged_mismatch(proj)
+                for rel in differing:
+                    print(f"BLOCK {rel}: ステージした内容（コミットされる内容）と、作業ディレクトリの内容が違います"
+                          "（ステージしたあとで変えた・消した、または git add していない）。検査は作業ディレクトリを"
+                          "読むので、このままでは、確かめていない内容がコミットされます。コミットに入れるなら "
+                          f"`git add {rel}`、入れないなら、その変更を取り除いてからコミットしてください")
+                if differing:
+                    return 1
+            # コミット前（--staged）は途中の保存。取り込みの前（--base）は、再構築中でも不整合を許容しない
+            tolerated: list[tuple[str, str]] = []
             with snapshot(proj.root, base_rev if diff_files is not None else None) as base:
-                problems = guard(proj, files, diff_files, strict=args.strict, base_rev=base_rev, base=base)
+                problems = guard(proj, files, diff_files, strict=args.strict, base_rev=base_rev, base=base,
+                                 in_progress=args.staged, tolerated=tolerated)
                 # 差分を調べるとき（コミット前・CI）は、変更する前と比べた後退も調べる
-                problems += [(item["id"], item["what"] + "。意図した変更なら、利用者の承認を得て、変更記録の "
-                              f"accepts に `{item['id']}` を、approved_by に承認した人の名前を書いてください")
-                             for item in regress(proj, base, strict=args.strict)["items"] if item["blocks"]]
+                for item in regress(proj, base, strict=args.strict)["items"]:
+                    if not item["blocks"]:
+                        continue
+                    change = regress_tolerated(proj, base, item["id"]) if args.staged else None
+                    if change is not None:
+                        tolerated.append((item["id"], item["what"] + f"（再構築 {change.id} の途中として許容。完了のときは、"
+                                          "基準のブランチと比べて、解消されているか・承認されているかを確かめます）"))
+                    else:
+                        problems.append((item["id"], item["what"] + "。意図した変更なら、利用者の承認を得て、変更記録の "
+                                         f"accepts に `{item['id']}` を、approved_by に承認した人の名前を書いてください"))
+            for rel, message in tolerated:
+                print(f"ALLOW {rel}: {message}")
             for rel, message in problems:
                 print(f"BLOCK {rel}: {message}")
             if not problems:
@@ -2444,7 +2610,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.change_command == "list":
                 for change in sorted(proj.changes.values(), key=lambda c: c.id):
                     scope = (change.components + [f"品質基盤 {g}" for g in change.quality_base]
-                             + [f"後退の受け入れ {a}" for a in change.accepts])
+                             + [f"後退の受け入れ {a}" for a in change.accepts]
+                             + (["再構築（承認: " + (change.approved_by or "なし") + "）"] if change.kind == "rebuild" else []))
                     print(f"{change.id} [{change.status}] {change.kind}: {change.title} "
                           f"（{', '.join(scope) or '範囲なし'}）")
                 return 0

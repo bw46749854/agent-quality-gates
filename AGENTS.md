@@ -45,6 +45,13 @@
   （`design-reviewer`・`test-reviewer`、または実装した本人以外の人）が必須かどうかは、`tracekit.py change review` が
   基準のブランチとの差分から判定する。自分で「軽微」と判断して省かない。それ以外の変更は、自分で見直すセルフレビューで足りる。
   受けていないレビューを `passed` と書かない。
+- **コミットは途中の保存、`change close` は完成の判定。** 動かない状態・テストが落ちる状態でも、作業ブランチにはコミットしてよい。
+  完了と報告できるのは、`change close` が通ったときだけ。コミットするときは、確かめた内容とコミットされる内容を揃える
+  （検査が読むファイルは、`git add` し直してからコミットする。コミット前の検査が、食い違いを止める）。
+- **既存の構成を作り替える依頼（アーキテクチャの再構築）は、調査・目標の構成・計画を示して、利用者の承認を得てから始める。**
+  承認された再構築（変更記録の `kind: rebuild`）のあいだだけ、途中の保存で、範囲の中の構造の不整合が許容される。
+  自分の判断で `rebuild` にしない。許容されるのは途中だけで、完了の条件（全ゲート、レビュー、トレーサビリティ）は変わらない。
+  手順は `develop` skill の「アーキテクチャの再構築」。
 - **変更が済んだら、変更記録を閉じる。** 進行中のまま残した変更記録は、あとの無関係な編集まで通してしまう。
 - **新しいコードは、台帳に宣言されたコンポーネントの置き場所に置く。** どこにも属さない場所に置きたくなったら、それは設計の変更なので、設計に戻る。
 - **宣言していない依存を作らない。** 必要になったら、動かすために黙って足すのではなく、設計の変更として `trace/components.toml` と `docs/architecture.md` を更新し、理由を残す。台帳（`trace/components.toml`）は品質基盤なので、変える前に利用者の承認を得る。
@@ -65,6 +72,7 @@
 - 既存の要件や受け入れ条件を変える・廃止する必要が出たとき
 - 品質ゲートを外す必要が出たとき（`required = true` のゲートは外せない。それ以外は、区分 `skip_kind`・理由 `skip_reason`・承認した人 `skip_approved_by` を書く。一時的な免除 `waiver` には期限 `skip_until` が必須）
 - 品質基盤（ゲートの定義、台帳、検査ツール、hook、CI、行動規約）を変える必要が出たとき
+- 変更を、アーキテクチャの再構築（`kind: rebuild`）として扱いたいとき
 - 以前あった保証（要件、受け入れ条件、それを確かめるテスト）を失う変更が必要になったとき
 
 通常の実装、テストの追加、範囲の中でのテストの修正は、確認なしで進めます。
@@ -79,6 +87,8 @@ python3 tools/tracekit.py impact --components COMP-X     # 変更前: 影響範�
 python3 tools/tracekit.py impact --base main             # 変更後: 基準のブランチとの差分から影響範囲を抽出
 python3 tools/tracekit.py change new --title "…" --kind fix --components COMP-X --requirements REQ-001
 python3 tools/tracekit.py change new --title "…" --kind chore --quality-base trace/gates.toml   # 品質基盤を変えるとき（承認した人は、承認を得てから Edit で書く）
+python3 tools/tracekit.py change new --title "…" --kind rebuild --components COMP-X,COMP-Y --requirements REQ-001   # アーキテクチャの再構築（承認が要る）
+python3 tools/tracekit.py check --in-progress    # 途中の保存の基準で検査（承認された再構築の範囲の不整合を、許容として表示）
 python3 tools/tracekit.py regress                # 基準のブランチと比べて、失われたもの・弱まったもの（後退）を報告する
 python3 tools/tracekit.py change review CHG-001  # 独立したレビューが必須か（差分から判定）と、いまのレビューの状態
 python3 tools/tracekit.py change close CHG-001   # レビューの状態を確かめ、全ゲートを実行し、通れば完了にする
@@ -93,6 +103,7 @@ python3 tools/verify.py                          # 品質ゲートを一括実�
   「承認された例外（SKIP:免除。対象があるのに検証していない）」「未設定（UNSET）」「今回は実行していない（NOTRUN）」を混ぜない。
   PASS 以外は、合格ではない。
 - レビューは、求められた水準（独立したレビューか、セルフレビューか）と判定を伝える。セルフレビューを「レビューで合格した」と書かない。
+- 再構築の途中で作業を区切るときは、「完了していない」ことと、許容されている不整合（`tracekit.py status` の件数）を伝える。
 - 基準を満たせなかったときは、満たせなかった点・理由・残るリスク・解決案を書く。満たしたことにしない。
 - 完了報告には、対応する要件ID、変更したコンポーネント、設計上の判断と理由、追加・変更したテスト、ゲートの結果、レビューの結果、残るリスクを含める。
 - `tracekit.py regress` の「承認済みの後退」「確かめてほしい点」「承認として記録されているもの」は、そのまま報告に含める。利用者は、これを読んで `main` に取り込むかを決める。

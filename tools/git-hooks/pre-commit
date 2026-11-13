@@ -4,14 +4,17 @@
 # （リポジトリの一部だけに入れた場合は、git のルートからのパスで指定する。例: services/shop/tools/git-hooks）
 #
 # 速い検査だけを行う。テストの実行を含む全ゲートは、完了時（change close）と CI が受け持つ。
+# コミットは「途中の保存」で、完了の判定ではない。動かない・テストが落ちる状態でもコミットできる。
+# 利用者が承認したアーキテクチャの再構築（変更記録の kind: rebuild）のあいだは、構造の不整合も許容して表示する。
 set -e
 # プロジェクトのルートは、この hook の場所から決める（git のルートと同じとは限らない）
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
 
+# ステージした本番コードと要件の変更が、影響分析済みの変更記録の範囲に入っているか。
+# 最初に、コミットされる内容（ステージ領域）と作業ディレクトリの内容が同じかを確かめる（検査は作業ディレクトリを読むため）
+"$py" "$root/tools/tracekit.py" guard --staged
+
 # 台帳・コード・テストの整合。生成物のマトリクスの鮮度は見ない（作業の途中のコミットのたびに作り直させないため。
 # マトリクスは change close が作り直し、品質ゲートの trace と CI が鮮度を確かめる）
-"$py" "$root/tools/tracekit.py" check --no-matrix
-
-# ステージした本番コードと要件の変更が、影響分析済みの変更記録の範囲に入っているか
-"$py" "$root/tools/tracekit.py" guard --staged
+"$py" "$root/tools/tracekit.py" check --no-matrix --in-progress

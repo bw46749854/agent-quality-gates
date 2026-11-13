@@ -10,8 +10,8 @@
   （コンポーネントを宣言した台帳をまだコミットしていない、導入の途中は止めない）。
 
 人に確かめるもの（Claude Code が利用者に確認のダイアログを出す。エージェントは代わりに答えられない）:
-- 変更記録に、承認を記録する編集。品質基盤の変更（quality_base）や後退の受け入れ（accepts）に、
-  承認した人（approved_by）を書く、または承認済みの記録に新しい対象を足す編集。
+- 変更記録に、承認を記録する編集。品質基盤の変更（quality_base）、後退の受け入れ（accepts）、
+  アーキテクチャの再構築（kind: rebuild）に、承認した人（approved_by）を書く、または承認済みの記録に新しい対象を足す編集。
   すでに記録されている対象について、もう一度は確かめない。
 - 設定で Bash にも掛けている場合は、シェルのコマンドで承認を書き込もうとする操作。
 
@@ -51,6 +51,8 @@ def approvals(tracekit, text: str) -> tuple[set[str], str, str]:
         meta, _ = tracekit.split_frontmatter(text)
         items = {f"品質基盤 {p}" for p in tracekit._as_list(meta.get("quality_base"), "quality_base")}
         items |= {f"後退の受け入れ {a}" for a in tracekit._as_list(meta.get("accepts"), "accepts")}
+        if str(meta.get("kind", "")).strip() == "rebuild":
+            items.add("アーキテクチャの再構築（完了までのあいだ、途中のコミットで、範囲の中の構造の不整合を許容する）")
     except ValueError:
         return set(), "", ""
     return items, str(meta.get("approved_by", "")).strip(), f"{meta.get('id', '')}「{meta.get('title', '')}」"
@@ -129,7 +131,7 @@ def main() -> int:
             if added:
                 return ask(f"変更記録 {label} に、あなた（{approver}）が承認したという記録を書きます。"
                            f"対象: {'、'.join(sorted(added))}。"
-                           "検査そのものや、以前あった要件・テストの保証を変える重要な変更です。"
+                           "検査そのもの、以前あった要件・テストの保証、途中の検査の厳しさを変える重要な変更です。"
                            "説明を受けて承認した内容と合っている場合だけ、許可してください")
     return 0
 

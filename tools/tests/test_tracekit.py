@@ -224,10 +224,14 @@ class CheckTest(ShopCase):
         self.assertIn("LEVEL-NOT-RUN", self.codes("warning", matrix=False))
 
 
-    def test_change_record_that_lists_quality_base_without_an_approver_is_an_error(self):
+    def test_change_record_awaiting_approval_may_be_kept_but_not_finished(self):
+        # 承認を待つあいだの記録は、何も通さないので、コミットしてよい（エラーにしない）。完了済みにはできない
         self.write("docs/changes/CHG-002.md",
                    "---\nid: CHG-002\ntitle: ゲートの見直し\nstatus: active\nkind: chore\n"
                    "requirements: []\ncomponents: []\nquality_base: [trace/gates.toml]\n---\n")
+        self.assertEqual(self.codes(matrix=False), [])
+        self.assertIn("CHG-AWAITING-APPROVAL", self.codes("warning", matrix=False))
+        self.replace("docs/changes/CHG-002.md", "status: active", "status: done")
         self.assertEqual(self.codes(matrix=False), ["CHG-NO-APPROVER"])
         self.replace("docs/changes/CHG-002.md", "quality_base: [trace/gates.toml]\n",
                      "quality_base: [trace/gates.toml]\napproved_by: 山田\n")
@@ -379,7 +383,7 @@ class GuardTest(ShopCase):
         # 変更記録に範囲を書くのは、エージェントでもできる。承認した人が書かれるまでは、通さない
         self.approved_change("trace/gates.toml", approved_by=" ")
         self.assertEqual([f for f, _ in tracekit.guard(self.project(), ["trace/gates.toml"])], ["trace/gates.toml"])
-        self.assertEqual(self.codes(matrix=False), ["CHG-NO-APPROVER"])
+        self.assertIn("CHG-AWAITING-APPROVAL", self.codes("warning", matrix=False))
         with self.assertRaises(tracekit.ConfigError):  # 承認する対象がないのに、名前だけは書けない
             tracekit.change_new(self.project(), "名前だけ", "chore", [], [], approved_by="山田")
 
@@ -425,6 +429,14 @@ class ChangeLifecycleTest(ShopCase):
         log = []
         self.assertFalse(tracekit.change_close(self.project(), change_id, echo=log.append))
         self.assertTrue(any("REQ-002" in line for line in log))
+
+    def test_change_awaiting_approval_cannot_be_closed(self):
+        path = self.approved_change("trace/gates.toml", approved_by="")
+        self.fill(path)
+        change_id = tracekit.split_frontmatter(path.read_text(encoding="utf-8"))[0]["id"]
+        log = []
+        self.assertFalse(tracekit.change_close(self.project(), change_id, echo=log.append))
+        self.assertTrue(any("承認" in line for line in log))
 
     def test_feature_change_without_requirement_cannot_be_created(self):
         with self.assertRaises(tracekit.ConfigError):
@@ -915,7 +927,7 @@ class RegressTest(GitCase):
                    "---\nid: CHG-002\ntitle: テストを消す\nstatus: active\nkind: chore\n"
                    "requirements: [REQ-001]\ncomponents: []\naccepts: [tests/unit/test_stock.py]\n---\n")
         self.assertIn("tests/unit/test_stock.py", self.unaccepted())
-        self.assertIn("CHG-NO-APPROVER", [f.code for f in tracekit.check(self.project(), matrix=False)])
+        self.assertIn("CHG-AWAITING-APPROVAL", [f.code for f in tracekit.check(self.project(), matrix=False)])
 
     def test_heavily_cut_test_is_reported_but_not_stopped(self):
         # ID を残して中身だけを抜く操作は、機械では不合格にできない。人とレビューの目に入るようにする
@@ -1025,6 +1037,13 @@ class RegressTest(GitCase):
         self.assertIn("tests/integration/helpers.py", "\n".join(report["notes"]))
         self.write("tests/integration/other_helpers.py", "X = 1\n")  # 足すだけなら報告しない
         self.assertNotIn("other_helpers", "\n".join(self.report()["notes"]))
+
+    def test_shared_helper_at_the_top_of_the_test_folder_is_reported_too(self):
+        # レベルごとのフォルダ（tests/unit/ など）の上に置いた、共通の補助ファイル
+        self.write("tests/support.py", "LIMIT = 3\n")
+        self.land_on_main()
+        self.write("tests/support.py", "LIMIT = 99\n")
+        self.assertIn("tests/support.py", "\n".join(self.report()["notes"]))
 
     def test_rewording_an_acceptance_criterion_is_reported_for_review(self):
         self.new_change(components=["COMP-ORDER"], requirements=["REQ-001"])
@@ -1235,6 +1254,20 @@ class GitDiffTest(GitCase):
         self.replace("trace/config.toml", 'source_roots = ["src"]', "source_roots = []")
         self.assertEqual(self.doctor(ci=True)["本番コードの置き場所"], "NG")
         self.assertEqual(self.cli("doctor", "--ci"), 1)
+
+    def test_intermediate_commit_is_not_stopped_by_a_stale_matrix(self):
+        # マトリクスは生成物で、change close が作り直す。途中のコミットのたびに作り直させない
+        shutil.copytree(REPO / "tools", self.root / "tools", ignore=shutil.ignore_patterns("__pycache__", "tests"))
+        (self.root / "tools" / "git-hooks" / "pre-commit").chmod(0o755)
+        self.git("add", "-A")
+        self.git("commit", "-q", "--no-verify", "-m", "tools")
+        self.git("config", "core.hooksPath", "tools/git-hooks")
+        self.write("docs/requirements/REQ-003.md",
+                   "---\nid: REQ-003\ntitle: 書きかけ\nstatus: draft\npriority: should\n"
+                   "components: []\nverify: []\n---\n")
+        self.assertIn("MATRIX-STALE", [f.code for f in tracekit.check(self.project())])
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "要件を書きかけでコミット")  # コミット前の検査を通る（落ちれば例外）
 
     def test_doctor_rejects_source_roots_that_cover_nothing(self):
         self.replace("trace/config.toml", 'source_roots = ["src"]', "source_roots = []")

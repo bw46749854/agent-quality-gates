@@ -175,7 +175,8 @@ python3 tools/tracekit.py regress
 | `GRAN-COARSE`（警告） | 変えると要件の大半に影響するコンポーネント（粗すぎる） |
 | `GRAN-SCATTERED`（警告） | 多くのコンポーネントにまたがる要件（細かすぎる・散らばっている） |
 | `MATRIX-STALE` | マトリクスが台帳と合っていない |
-| `CHG-NO-APPROVER` | 品質基盤の変更（`quality_base`）や後退の受け入れ（`accepts`）を書いているのに、承認した人が書かれていない変更記録 |
+| `CHG-NO-APPROVER` | 品質基盤の変更（`quality_base`）や後退の受け入れ（`accepts`）を書いているのに、承認した人が書かれていない、完了済みの変更記録 |
+| `CHG-AWAITING-APPROVAL`（警告） | 承認を待っている、進行中の変更記録（承認されるまで何も通さない。完了にはできない） |
 
 同じ種類の警告が多いときは、先頭の10件と件数だけを表示します（`check --all` ですべて表示）。
 

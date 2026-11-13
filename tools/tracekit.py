@@ -838,8 +838,12 @@ def check(proj: Project, matrix: bool = True) -> list[Finding]:
         if (change.kind in ("feature", "fix") and change.status != "abandoned"
                 and not change.requirements):
             err("CHG-NO-REQ", f"{change.id}: kind が {change.kind} の変更には、対象の要件が必要です", change.path)
-        if ((change.quality_base or change.accepts) and not change.approved_by
-                and change.status != "abandoned"):
+        if (change.quality_base or change.accepts) and not change.approved_by and change.status == "active":
+            # 承認を待っている記録。承認した人が書かれるまで何も通さないので、残しておいてよい
+            warn("CHG-AWAITING-APPROVAL", f"{change.id}: 承認待ちです（quality_base・accepts はあるが、approved_by が"
+                 "ない）。承認されるまで、この記録はどの変更も通しません。承認を得たら approved_by を書きます",
+                 change.path, change.id)
+        elif (change.quality_base or change.accepts) and not change.approved_by and change.status == "done":
             err("CHG-NO-APPROVER", f"{change.id}: 品質基盤の変更（quality_base）か、後退の受け入れ（accepts）を"
                 "書いていますが、承認した人（approved_by）が書かれていません。利用者に説明して承認を得てから、"
                 "その人の名前を書いてください（承認が得られないなら、quality_base・accepts を消して、変更をやめます）",
@@ -1346,9 +1350,10 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
 
     # -- テストの補助ファイル（代用品、共通の準備など）。テストファイルではないので、どの要件にも結びつかない。
     #    書き換えればテストを骨抜きにできるので、変わった・消えたものを報告する（足しただけなら報告しない）
-    prefixes = {re.split(r"[*?\[]", g.strip().removeprefix("./"), maxsplit=1)[0].rsplit("/", 1)[0] + "/"
-                for globs in proj.cfg["tests"].values() for g in globs}
-    prefixes.discard("/")
+    # レベルごとのフォルダ（tests/unit/ など）の上に共通の補助ファイルを置くことが多いので、最上位のフォルダから見る
+    prefixes = {re.split(r"[*?\[]", g.strip().removeprefix("./"), maxsplit=1)[0].split("/", 1)[0] + "/"
+                for globs in proj.cfg["tests"].values() for g in globs
+                if "/" in re.split(r"[*?\[]", g.strip().removeprefix("./"), maxsplit=1)[0]}
 
     def helpers(project: Project) -> set[str]:
         return {rel for rel in list_files(project.root)
@@ -1650,6 +1655,9 @@ def change_close(proj: Project, change_id: str, echo=print) -> bool:
         content = re.sub(r"<!--.*?-->", "", sections.get(name, ""), flags=re.S).strip()
         if not content:
             problems.append(f"「{name}」が書かれていません")
+    if (change.quality_base or change.accepts) and not change.approved_by:
+        problems.append("承認待ちです（quality_base・accepts はあるが、approved_by がない）。承認を得て approved_by を"
+                        "書くか、承認が得られないなら quality_base・accepts を消してください")
     for rid in change.requirements:
         req = proj.requirements.get(rid)
         if req is not None and req.status not in ("implemented", "deprecated"):

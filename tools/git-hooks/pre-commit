@@ -9,8 +9,9 @@ set -e
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
 
-# 台帳・コード・テストの整合（生成物のマトリクスが古くないかも含む）
-"$py" "$root/tools/tracekit.py" check
+# 台帳・コード・テストの整合。生成物のマトリクスの鮮度は見ない（作業の途中のコミットのたびに作り直させないため。
+# マトリクスは change close が作り直し、品質ゲートの trace と CI が鮮度を確かめる）
+"$py" "$root/tools/tracekit.py" check --no-matrix
 
 # ステージした本番コードと要件の変更が、影響分析済みの変更記録の範囲に入っているか
 "$py" "$root/tools/tracekit.py" guard --staged

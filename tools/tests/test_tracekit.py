@@ -63,6 +63,11 @@ class ShopCase(unittest.TestCase):
         return tracekit.change_new(self.project(), "品質基盤の見直し", "chore", [], [],
                                    quality_base=list(paths), approved_by=approved_by)
 
+    def accepting_change(self, *items, requirements=(), components=(), approved_by="山田"):
+        """後退（要件の廃止、テストの削除など）を、承認つきで受け入れる変更記録。"""
+        return tracekit.change_new(self.project(), "後退を受け入れる", "chore", list(components),
+                                   list(requirements), accepts=list(items), approved_by=approved_by)
+
     def fill(self, path):
         text = path.read_text(encoding="utf-8")
         path.write_text(re.sub(r"<!--.*?-->", "記入済み", text, flags=re.S), encoding="utf-8")
@@ -318,8 +323,17 @@ class GuardTest(ShopCase):
         self.replace("docs/requirements/REQ-002.md", "status: draft", "status: approved")
         self.assertEqual(tracekit.guard(self.project(), ["src/order/service.py"]), [])
 
-    def test_tests_and_docs_are_never_blocked(self):
-        files = ["tests/unit/test_stock.py", "docs/requirements/REQ-001.md", "README.md"]
+    def test_docs_and_new_tests_are_never_blocked(self):
+        files = ["tests/unit/test_new.py", "docs/requirements/REQ-001.md", "README.md"]
+        self.assertEqual(tracekit.guard(self.project(), files), [])
+
+    def test_changing_an_existing_test_needs_its_requirement_in_an_active_change(self):
+        # 通らないテストを、関係のない作業のついでに書き換えたり消したりさせない
+        files = ["tests/unit/test_stock.py"]  # REQ-001 を確かめている
+        self.assertEqual([f for f, _ in tracekit.guard(self.project(), files)], files)
+        self.new_change(components=["COMP-ORDER"], requirements=["REQ-002"])
+        self.assertEqual([f for f, _ in tracekit.guard(self.project(), files)], files)
+        self.new_change(components=["COMP-ORDER"], requirements=["REQ-001"])
         self.assertEqual(tracekit.guard(self.project(), files), [])
 
 
@@ -348,8 +362,8 @@ class GuardTest(ShopCase):
 
 
     def test_quality_base_change_needs_a_change_record_that_names_who_approved_it(self):
-        base = ["trace/gates.toml", "trace/config.toml", "trace/components.toml", "tools/verify.py", "tools/tests/test_tracekit.py",
-                "tools/git-hooks/pre-commit", ".github/workflows/quality.yml", ".claude/hooks/pre_edit.py",
+        base = ["trace/gates.toml", "trace/config.toml", "trace/components.toml", "tools/verify.py", "tools/tests/test_added.py",
+                "docs/CODEOWNERS", "tools/git-hooks/pre-commit", ".github/workflows/quality.yml", ".claude/hooks/pre_edit.py",
                 ".claude/settings.json", ".claude/skills/develop/SKILL.md", "AGENTS.md", "CLAUDE.md"]
         self.assertEqual([f for f, _ in tracekit.guard(self.project(), base)], base)
         self.assertIn("承認", tracekit.guard(self.project(), base)[0][1])
@@ -357,13 +371,17 @@ class GuardTest(ShopCase):
         self.assertEqual([f for f, _ in tracekit.guard(self.project(), base)], base)
         self.approved_change("trace/gates.toml", "tools/**")
         self.assertEqual([f for f, _ in tracekit.guard(self.project(), base)],
-                         ["trace/config.toml", "trace/components.toml",
+                         ["trace/config.toml", "trace/components.toml", "docs/CODEOWNERS",
                           ".github/workflows/quality.yml", ".claude/hooks/pre_edit.py",
                           ".claude/settings.json", ".claude/skills/develop/SKILL.md", "AGENTS.md", "CLAUDE.md"])
 
-    def test_quality_base_cannot_be_approved_by_nobody(self):
-        with self.assertRaises(tracekit.ConfigError):
-            self.approved_change("trace/gates.toml", approved_by=" ")
+    def test_declaring_the_scope_is_not_an_approval(self):
+        # 変更記録に範囲を書くのは、エージェントでもできる。承認した人が書かれるまでは、通さない
+        self.approved_change("trace/gates.toml", approved_by=" ")
+        self.assertEqual([f for f, _ in tracekit.guard(self.project(), ["trace/gates.toml"])], ["trace/gates.toml"])
+        self.assertEqual(self.codes(matrix=False), ["CHG-NO-APPROVER"])
+        with self.assertRaises(tracekit.ConfigError):  # 承認する対象がないのに、名前だけは書けない
+            tracekit.change_new(self.project(), "名前だけ", "chore", [], [], approved_by="山田")
 
     def test_projects_may_add_their_own_quality_base_but_cannot_remove_the_built_in_one(self):
         self.assertEqual(tracekit.guard(self.project(), ["ruff.toml"]), [])
@@ -486,6 +504,29 @@ class VerifyTest(ShopCase):
         self.assertEqual((status, ok), ("SKIP", True))
         self.assertIn("対象なし", detail)
 
+    def test_test_gate_that_ran_no_tests_does_not_pass(self):
+        pattern = "count_pattern = 'Ran (\\d+) tests?'\n"
+        status, detail, ok = self.gate_x("cmd = \"echo 'Ran 0 tests in 0.000s'\"\n" + pattern)
+        self.assertEqual((status, ok), ("FAIL", False))
+        self.assertIn("0 件", detail)
+
+    def test_test_gate_whose_output_shows_no_count_does_not_pass(self):
+        status, detail, _ = self.gate_x("cmd = \"echo done\"\ncount_pattern = 'Ran (\\d+) tests?'\n")
+        self.assertEqual(status, "FAIL")
+        self.assertIn("count_pattern", detail)
+
+    def test_test_gate_reports_how_many_tests_ran(self):
+        status, detail, ok = self.gate_x("cmd = \"echo 'Ran 12 tests in 0.1s'\"\ncount_pattern = 'Ran (\\d+) tests?'\n")
+        self.assertEqual((status, ok), ("PASS", True))
+        self.assertIn("12 件", detail)
+
+    def test_sample_gates_count_the_tests_they_run(self):
+        results, ok = verify.run_gates(self.root, echo=lambda _: None)
+        self.assertTrue(ok)
+        detail = {r["id"]: r["detail"] for r in results}
+        self.assertRegex(detail["unit"], r"[1-9]\d* 件")
+        self.assertRegex(detail["integration"], r"[1-9]\d* 件")
+
     def test_skipped_gates_are_reported_as_not_verified(self):
         report = self.root / "out" / "gates.json"
         out = io.StringIO()
@@ -560,7 +601,7 @@ class HookTest(ShopCase):
         self.assertEqual(self.run_hook("pre_edit.py", self.edit("src/inventory/stock.py")).returncode, 2)
 
     def test_pre_edit_allows_tests_docs_and_files_outside_project(self):
-        for rel in ("tests/unit/test_stock.py", "docs/requirements/REQ-009.md", "docs/architecture.md"):
+        for rel in ("tests/unit/test_new.py", "docs/requirements/REQ-009.md", "docs/architecture.md"):
             self.assertEqual(self.run_hook("pre_edit.py", self.edit(rel)).returncode, 0, rel)
         outside = {"tool_name": "Write", "cwd": str(self.root), "tool_input": {"file_path": "/tmp/x.py"}}
         self.assertEqual(self.run_hook("pre_edit.py", outside).returncode, 0)
@@ -572,6 +613,70 @@ class HookTest(ShopCase):
         # 台帳を壊しておけば、検査ツールやゲートを自由に書き換えられる、という抜け道にしない
         self.assertEqual(self.run_hook("pre_edit.py", self.edit("trace/gates.toml")).returncode, 2)
         self.assertEqual(self.run_hook("pre_edit.py", self.edit("tools/verify.py")).returncode, 2)
+
+    RECORD = ("---\nid: CHG-002\ntitle: ゲートの見直し\nstatus: active\nkind: chore\n"
+              "requirements: []\ncomponents: []\n{extra}---\n\n## 目的\n{body}\n")
+
+    def decision(self, done):
+        self.assertEqual(done.returncode, 0, done.stderr)
+        if not done.stdout.strip():
+            return None, ""
+        out = json.loads(done.stdout)["hookSpecificOutput"]
+        self.assertEqual(out["hookEventName"], "PreToolUse")
+        return out["permissionDecision"], out["permissionDecisionReason"]
+
+    def write_payload(self, rel, content):
+        return {"hook_event_name": "PreToolUse", "tool_name": "Write", "cwd": str(self.root),
+                "tool_input": {"file_path": str(self.root / rel), "content": content}}
+
+    def edit_payload(self, rel, old, new):
+        return {"hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": str(self.root),
+                "tool_input": {"file_path": str(self.root / rel), "old_string": old, "new_string": new}}
+
+    def test_recording_an_approval_makes_claude_code_ask_the_person(self):
+        rel = "docs/changes/CHG-002.md"
+        plain = self.RECORD.format(extra="", body="まだ承認はない")
+        self.assertEqual(self.decision(self.run_hook("pre_edit.py", self.write_payload(rel, plain)))[0], None)
+        unapproved = self.RECORD.format(extra="quality_base: [trace/gates.toml]\n", body="範囲を宣言しただけ")
+        self.assertEqual(self.decision(self.run_hook("pre_edit.py", self.write_payload(rel, unapproved)))[0], None)
+        approved = self.RECORD.format(extra="quality_base: [trace/gates.toml]\napproved_by: 山田\n", body="承認を記録")
+        decision, reason = self.decision(self.run_hook("pre_edit.py", self.write_payload(rel, approved)))
+        self.assertEqual(decision, "ask")
+        for expected in ("CHG-002", "trace/gates.toml", "山田"):
+            self.assertIn(expected, reason)
+
+    def test_the_person_is_not_asked_again_for_what_is_already_recorded(self):
+        rel = "docs/changes/CHG-002.md"
+        self.write(rel, self.RECORD.format(extra="quality_base: [trace/gates.toml]\napproved_by: 山田\n", body="本文"))
+        body_only = self.edit_payload(rel, "本文", "本文を書き足した")
+        self.assertEqual(self.decision(self.run_hook("pre_edit.py", body_only))[0], None)
+        wider = self.edit_payload(rel, "quality_base: [trace/gates.toml]",
+                                  "quality_base: [trace/gates.toml]\naccepts: [REQ-002]")
+        decision, reason = self.decision(self.run_hook("pre_edit.py", wider))
+        self.assertEqual(decision, "ask")
+        self.assertIn("REQ-002", reason)
+        self.assertNotIn("trace/gates.toml", reason)  # すでに承認済みのものは、もう一度は聞かない
+
+    def test_approval_written_through_the_shell_is_also_asked_when_the_hook_sees_bash(self):
+        def bash(command):
+            return {"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": str(self.root),
+                    "tool_input": {"command": command}}
+        forged = "sed -i 's/^approved_by:.*/approved_by: 山田/' docs/changes/CHG-002.md"
+        self.assertEqual(self.decision(self.run_hook("pre_edit.py", bash(forged)))[0], "ask")
+        self.assertEqual(self.decision(self.run_hook("pre_edit.py", bash("python3 tools/verify.py")))[0], None)
+
+    def test_hooks_do_not_open_the_door_when_they_break(self):
+        broken = {"hook_event_name": "PreToolUse", "tool_name": "Edit", "tool_input": "壊れた入力"}
+        self.assertEqual(self.run_hook("pre_edit.py", broken).returncode, 2)
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.root))
+        garbage = subprocess.run([sys.executable, str(HOOKS / "pre_edit.py")], input="JSON ではない",
+                                 capture_output=True, text=True, env=env)
+        self.assertEqual(garbage.returncode, 2)
+        self.replace("trace/config.toml", "[tests]", 'tests = "壊れた設定"\n[other]')  # 検査が内部エラーになる設定
+        stop = self.run_hook("on_stop.py", {"hook_event_name": "Stop", "stop_hook_active": False})
+        self.assertEqual(stop.returncode, 2)
+        again = self.run_hook("on_stop.py", {"hook_event_name": "Stop", "stop_hook_active": True})
+        self.assertEqual(again.returncode, 0)  # 止め続けて終われなくなることはない
 
     def test_hooks_answer_a_probe_so_that_doctor_can_tell_they_are_really_called(self):
         env = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.root), TRACEKIT_PROBE="1")
@@ -608,8 +713,7 @@ class HookTest(ShopCase):
         self.assertIn("CHG-002", done.stdout)
 
 
-@unittest.skipUnless(shutil.which("git"), "git がありません")
-class GitDiffTest(ShopCase):
+class GitCase(ShopCase):
     def git(self, *args):
         subprocess.run(["git", "-C", str(self.root), "-c", "user.name=t",
                         "-c", "user.email=t@example.invalid", *args],
@@ -617,13 +721,237 @@ class GitDiffTest(ShopCase):
 
     def setUp(self):
         super().setUp()
-        self.git("init", "-q")
+        self.git("init", "-q", "-b", "main")
         self.git("add", "-A")
         self.git("commit", "-q", "-m", "init")
+
+    def commit(self, message="作業"):
+        self.git("add", "-A")
+        self.git("commit", "-q", "--no-verify", "-m", message)
+
+    def land_on_main(self):
+        """いまの作業を main に取り込み、作業ブランチに戻る（利用者が取り込んだあとの状態）。"""
+        self.commit()
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "work")
+        self.git("checkout", "-q", "work")
 
     def cli(self, *args):
         with contextlib.redirect_stdout(io.StringIO()):
             return tracekit.main(["--root", str(self.root), *args])
+
+    def cli_text(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = tracekit.main(["--root", str(self.root), *args])
+        return code, out.getvalue()
+
+
+@unittest.skipUnless(shutil.which("git"), "git がありません")
+class RegressTest(GitCase):
+    """変更する前（main）と比べて、失われたもの・弱まったものを見つける。"""
+
+    def setUp(self):
+        super().setUp()
+        self.git("checkout", "-q", "-b", "work")
+
+    def base(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        return stack.enter_context(tracekit.snapshot(self.root, tracekit.base_revision(self.project())))
+
+    def report(self):
+        return tracekit.regress(self.project(), self.base())
+
+    def unaccepted(self):
+        return sorted(item["id"] for item in self.report()["items"] if item["blocks"])
+
+    def gut_tests(self):
+        """ID は残したまま、中身だけを何も確かめないテストに置き換える。"""
+        for path in sorted((self.root / "tests").rglob("test_*.py")):
+            ids = sorted(set(re.findall(r"REQ-\d+/AC-\d+", path.read_text(encoding="utf-8"))))
+            path.write_text('"""' + " ".join(ids) + '"""\nimport unittest\n\n\nclass T(unittest.TestCase):\n'
+                            "    def test_x(self):\n        self.assertTrue(True)\n", encoding="utf-8")
+
+    def test_untouched_project_has_nothing_to_report(self):
+        report = self.report()
+        self.assertEqual(report["items"], [])
+        self.assertEqual(report["notes"], [])
+        self.assertEqual(self.cli("regress"), 0)
+
+    def test_ordinary_work_needs_no_acceptance(self):
+        self.new_change(components=["COMP-ORDER"], requirements=["REQ-002"])
+        self.append("src/order/service.py", "\n# 実装の変更\n")
+        self.append("tests/integration/test_order_flow.py", "\n# REQ-002/AC-1 のテストを足した\n")
+        self.write("tests/unit/test_order_rules.py", '"""REQ-002/AC-2"""\n')
+        self.assertEqual(self.unaccepted(), [])
+        self.assertEqual(self.cli("guard", "--base", "main"), 0)
+
+    def test_deleting_requirements_records_and_tests_is_stopped(self):
+        # 第3回のレビューで通ってしまった操作。いまある台帳だけを見ると、整合していて合格に見える
+        for rel in ("docs/requirements/REQ-001.md", "docs/requirements/REQ-002.md", "docs/changes/CHG-001.md",
+                    "tests/unit/test_stock.py", "tests/integration/test_order_flow.py"):
+            (self.root / rel).unlink()
+        for level in ("unit", "integration"):
+            self.write(f"tests/{level}/test_dummy.py", "import unittest\n\n\nclass T(unittest.TestCase):\n"
+                       "    def test_x(self):\n        self.assertTrue(True)\n")
+        self.cli("matrix", "--write")
+        self.assertEqual([f for f in tracekit.check(self.project()) if f.level == "error"], [])
+        found = self.unaccepted()
+        for expected in ("REQ-001", "REQ-002", "CHG-001", "tests/unit/test_stock.py",
+                         "tests/integration/test_order_flow.py", "TEST-UNLINKED:tests/unit/test_dummy.py",
+                         "COMP-NOREQ:COMP-ORDER"):
+            self.assertIn(expected, found)
+        self.assertEqual(self.cli("guard", "--base", "main", "--strict"), 1)
+        self.assertEqual(self.cli("regress"), 1)
+        self.commit("コミットしてしまっても、main との比較では見つかる")
+        self.assertEqual(self.cli("regress"), 1)
+
+    def test_requirement_sent_back_to_draft_needs_a_record_and_an_acceptance(self):
+        self.replace("docs/requirements/REQ-001.md", "status: implemented", "status: draft")
+        self.replace("docs/requirements/REQ-001.md", "title: 在庫がある商品を注文できる", "title: 書き換えた")
+        self.cli("matrix", "--write")
+        self.assertEqual(self.cli("guard", "--base", "main"), 1)
+        self.assertEqual(self.unaccepted(), ["REQ-001"])
+        self.new_change(components=["COMP-ORDER"], requirements=["REQ-001"])  # 記録だけでは足りない
+        self.assertEqual(self.unaccepted(), ["REQ-001"])
+        self.accepting_change("REQ-001", requirements=["REQ-001"])
+        self.assertEqual(self.unaccepted(), [])
+
+    def test_deleted_requirement_must_be_named_in_a_change_record(self):
+        (self.root / "docs/requirements/REQ-002.md").unlink()
+        problems = tracekit.guard(self.project(), ["docs/requirements/REQ-002.md"],
+                                  diff_files=["docs/requirements/REQ-002.md"], base=self.base())
+        self.assertEqual([f for f, _ in problems], ["docs/requirements/REQ-002.md"])
+        self.assertIn("REQ-002", self.unaccepted())
+
+    def test_removed_acceptance_criterion_needs_acceptance(self):
+        self.replace("docs/requirements/REQ-002.md",
+                     "- **AC-2**: WHEN キャンセル済みの注文をもう一度キャンセルする THEN 拒否され、在庫数は変わらない\n", "")
+        self.replace("tests/integration/test_order_flow.py", "REQ-002/AC-2", "二重キャンセル")
+        self.assertEqual(self.unaccepted(), ["REQ-002/AC-2"])
+        self.accepting_change("REQ-002/AC-2", requirements=["REQ-002"])
+        self.assertEqual(self.unaccepted(), [])
+
+    def test_criterion_that_loses_its_last_test_needs_acceptance(self):
+        self.replace("tests/integration/test_order_flow.py", "REQ-002/AC-2", "二重キャンセル")
+        self.assertEqual(self.unaccepted(), ["REQ-002/AC-2"])
+
+    def test_criterion_that_keeps_another_test_is_only_noted(self):
+        self.replace("tests/unit/test_stock.py", '"""REQ-001/AC-3"""', '"""数量の検査"""')  # 結合テストに残っている
+        report = self.report()
+        self.assertEqual([item for item in report["items"] if item["blocks"]], [])
+        self.assertTrue(any("REQ-001/AC-3" in note and "tests/unit/test_stock.py" in note for note in report["notes"]))
+
+    def test_deleting_a_test_needs_acceptance_but_moving_it_does_not(self):
+        self.git("mv", "tests/unit/test_stock.py", "tests/unit/test_stock_rules.py")
+        self.assertEqual(self.unaccepted(), [])
+        (self.root / "tests/unit/test_stock_rules.py").unlink()
+        self.assertIn("tests/unit/test_stock.py", self.unaccepted())
+
+    def test_accepting_the_end_of_a_requirement_covers_its_criteria_and_its_own_tests(self):
+        self.write("tests/unit/test_cancel.py", '"""REQ-002/AC-1"""\n')
+        self.land_on_main()
+        self.replace("docs/requirements/REQ-002.md", "status: implemented", "status: deprecated")
+        (self.root / "tests/unit/test_cancel.py").unlink()
+        stale = "TEST-DEPRECATED:tests/integration/test_order_flow.py>REQ-002"  # 廃止した要件のテストが残っている
+        self.assertEqual(self.unaccepted(), ["REQ-002", stale, "tests/unit/test_cancel.py"])
+        self.accepting_change("REQ-002", requirements=["REQ-002"])
+        self.assertEqual(self.unaccepted(), [stale])  # 承認したのは要件の廃止。残ったテストは片づける
+        self.replace("tests/integration/test_order_flow.py", "REQ-002/AC-1", "キャンセル")
+        self.replace("tests/integration/test_order_flow.py", "REQ-002/AC-2", "二重キャンセル")
+        self.assertEqual(self.unaccepted(), [])
+
+    def test_finished_change_record_is_history_and_may_not_be_rewritten_or_deleted(self):
+        self.append("docs/changes/CHG-001.md", "\nあとから書き足した\n")
+        self.assertEqual(self.unaccepted(), ["CHG-001"])
+        (self.root / "docs/changes/CHG-001.md").unlink()
+        self.assertEqual(self.unaccepted(), ["CHG-001"])
+
+    def test_warning_that_is_new_is_stopped_and_one_that_was_already_there_is_not(self):
+        self.write("tests/unit/test_legacy.py", "X = 1\n")  # 以前からある、要件IDのないテスト
+        self.land_on_main()
+        self.assertEqual(self.unaccepted(), [])
+        self.write("tests/unit/test_new.py", "X = 1\n")
+        self.assertEqual(self.unaccepted(), ["TEST-UNLINKED:tests/unit/test_new.py"])
+        (self.root / "tests/unit/test_legacy.py").unlink()  # 件数は 1 のまま。件数で比べると見逃す
+        report = self.report()
+        self.assertEqual(sorted(i["id"] for i in report["items"] if i["blocks"]),
+                         ["TEST-UNLINKED:tests/unit/test_new.py"])
+        self.assertEqual(report["resolved_warnings"], ["TEST-UNLINKED:tests/unit/test_legacy.py"])
+        self.accepting_change("TEST-UNLINKED:tests/unit/test_new.py")
+        self.assertEqual(self.unaccepted(), [])
+
+    def test_acceptance_without_the_name_of_who_approved_it_does_not_count(self):
+        (self.root / "tests/unit/test_stock.py").unlink()
+        self.write("docs/changes/CHG-002.md",
+                   "---\nid: CHG-002\ntitle: テストを消す\nstatus: active\nkind: chore\n"
+                   "requirements: [REQ-001]\ncomponents: []\naccepts: [tests/unit/test_stock.py]\n---\n")
+        self.assertIn("tests/unit/test_stock.py", self.unaccepted())
+        self.assertIn("CHG-NO-APPROVER", [f.code for f in tracekit.check(self.project(), matrix=False)])
+
+    def test_heavily_cut_test_is_reported_but_not_stopped(self):
+        # ID を残して中身だけを抜く操作は、機械では不合格にできない。人とレビューの目に入るようにする
+        self.new_change(components=["COMP-ORDER"], requirements=["REQ-001", "REQ-002"])
+        self.gut_tests()
+        report = self.report()
+        self.assertEqual([item for item in report["items"] if item["blocks"]], [])
+        notes = "\n".join(report["notes"])
+        self.assertIn("tests/integration/test_order_flow.py", notes)
+        self.assertIn("確かめる文", notes)
+        code, text = self.cli_text("regress")
+        self.assertEqual(code, 0)
+        self.assertIn("tests/integration/test_order_flow.py", text)
+
+    def test_changing_a_test_needs_its_requirement_in_a_change_record_of_the_diff(self):
+        self.append("tests/unit/test_stock.py", "\n# 期待値を変えた\n")
+        self.assertEqual(self.cli("guard", "--base", "main"), 1)
+        self.new_change(components=["COMP-ORDER"], requirements=["REQ-002"])
+        self.assertEqual(self.cli("guard", "--base", "main"), 1)  # REQ-001 のテスト。REQ-002 の変更では通らない
+        self.new_change(components=["COMP-ORDER"], requirements=["REQ-001"])
+        self.assertEqual(self.cli("guard", "--base", "main"), 0)
+
+    def test_comparison_is_made_against_main_whether_or_not_the_work_is_committed(self):
+        self.assertEqual(tracekit.base_revision(self.project()),
+                         subprocess.run(["git", "-C", str(self.root), "rev-parse", "main"],
+                                        capture_output=True, text=True).stdout.strip())
+        (self.root / "tests/unit/test_stock.py").unlink()
+        self.commit("検査を飛ばしてコミットした")
+        self.write("tests/unit/test_new.py", "X = 1\n")  # まだ git に足していない新しいファイル
+        found = self.unaccepted()
+        self.assertIn("tests/unit/test_stock.py", found)
+        self.assertIn("TEST-UNLINKED:tests/unit/test_new.py", found)
+
+    def test_stop_hook_compares_with_main_not_only_with_the_last_commit(self):
+        (self.root / "tests/unit/test_stock.py").unlink()
+        self.commit("検査を飛ばしてコミットした")
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.root))
+        done = subprocess.run([sys.executable, str(HOOKS / "on_stop.py")],
+                              input=json.dumps({"hook_event_name": "Stop", "stop_hook_active": False}),
+                              capture_output=True, text=True, env=env, encoding="utf-8")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("tests/unit/test_stock.py", done.stderr)
+
+    def test_quality_gates_include_the_comparison(self):
+        results, ok = verify.run_gates(self.root, echo=lambda _: None)
+        self.assertTrue(ok)
+        self.assertEqual([r["id"] for r in results][:2], ["trace", "regress"])
+        self.replace("docs/requirements/REQ-001.md", "status: implemented", "status: draft")
+        self.cli("matrix", "--write")
+        results, ok = verify.run_gates(self.root, echo=lambda _: None)
+        self.assertFalse(ok)
+        self.assertEqual({r["id"]: r["status"] for r in results}["regress"], "FAIL")
+
+    def test_doctor_tells_when_the_branch_to_compare_with_is_missing(self):
+        state = {item: s for s, item, _ in tracekit.doctor(self.root)}
+        self.assertEqual(state["比較の基準"], "OK")
+        self.replace("trace/config.toml", 'source_roots = ["src"]', 'source_roots = ["src"]\nbase_branch = "trunk"')
+        state = {item: s for s, item, _ in tracekit.doctor(self.root)}
+        self.assertEqual(state["比較の基準"], "WARN")
+
+
+@unittest.skipUnless(shutil.which("git"), "git がありません")
+class GitDiffTest(GitCase):
 
     def test_guard_on_diff_requires_change_record_in_the_same_diff(self):
         self.append("src/order/service.py", "\n# 変更\n")

@@ -18,11 +18,12 @@ description: 要件をどのコンポーネントが担うかを決めるとき�
 3. **割り当てられないものがあれば、境界を見直す。** 下の「境界の決め方」に従う。
 4. **依存の向きを決める。** 下の「依存の決め方」に従う。
 5. **台帳を変える必要があるなら、先に利用者の承認を得る。** `trace/components.toml` は品質基盤で、承認の記録がないと
-   hook が編集を止める。変える内容（足すコンポーネント、足す依存、変える境界）と、選ばなかった案を示して承認を得てから、
-   変更記録を作る（進行中の変更記録があれば、その先頭部分に `quality_base: [trace/components.toml]` と `approved_by: 名前` を足す）。
+   hook が編集を止める。変える内容（足すコンポーネント、足す依存、変える境界）と、選ばなかった案を利用者に示す。
+   変更記録を作り（進行中の変更記録があれば、その先頭部分に `quality_base: [trace/components.toml]` を足す）、
+   承認が得られたら、`approved_by:` に承認した人の名前を Edit で書く（Claude Code では、このとき利用者に確認のダイアログが出る）。
    ```bash
    python3 tools/tracekit.py change new --title "（何をするか）" --kind feature --requirements REQ-001 \
-       --quality-base trace/components.toml --approved-by "（承認した人の名前）"
+       --quality-base trace/components.toml
    ```
    新しいコンポーネントは、台帳に書いたあとで、変更記録の `components` に足す（影響分析の工程で行う）。
    導入の途中（コンポーネントを宣言した台帳を、まだ一度もコミットしていない）なら、この手順は要らない。

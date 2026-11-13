@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import re
 import subprocess
 import sys
 import time
@@ -50,15 +51,36 @@ def run_gates(root: Path, only: list[str] | None = None, echo=print) -> tuple[li
         if status == "FAIL" and output:
             echo("\n".join("    " + line for line in _tail(output).splitlines()))
 
+    project = None
     if not only or "trace" in only:
         try:
-            findings = tracekit.check(tracekit.Project(root))
+            project = tracekit.Project(root)
+            findings = tracekit.check(project)
             errors = sum(1 for f in findings if f.level == "error")
             record("trace", "トレーサビリティ検査", "FAIL" if errors else "PASS",
                    f"エラー {errors} 件、警告 {len(findings) - errors} 件",
                    "\n".join(f.render() for f in findings))
         except tracekit.ConfigError as exc:
             record("trace", "トレーサビリティ検査", "FAIL", "台帳を読めません", str(exc))
+
+    # 変更する前（基準のブランチとの分かれ目）と比べる。いまの台帳が整合していても、要件やテストを消した結果かもしれない。
+    # git の外や、導入の途中（変更する前にコンポーネントがない）では比べられないので、記録しない（doctor が知らせる）
+    if not only or "regress" in only:
+        try:
+            project = project or tracekit.Project(root)
+            base_name = str(project.cfg["base_branch"])
+            with tracekit.snapshot(root, tracekit.base_revision(project)) as base:
+                report = tracekit.regress(project, base)
+            if report["compared"]:
+                blocking = sum(1 for item in report["items"] if item["blocks"])
+                record("regress", f"後退の検出（{base_name} との比較）", "FAIL" if blocking else "PASS",
+                       f"承認されていない後退 {blocking} 件、承認済み {len(report['items']) - blocking} 件、"
+                       f"確かめてほしい点 {len(report['notes'])} 件"
+                       + ("（`python3 tools/tracekit.py regress` で内容を確認する）"
+                          if report["items"] or report["notes"] else ""),
+                       tracekit.render_regress(report, base_name))
+        except tracekit.ConfigError:
+            pass  # 台帳を読めないことは、上の trace が不合格にしている
 
     try:
         gates = load_gates(root)
@@ -83,8 +105,25 @@ def run_gates(root: Path, only: list[str] | None = None, echo=print) -> tuple[li
                 record(gate_id, name, "FAIL", f"時間切れ: `{cmd}`")
                 continue
             seconds = f"{time.monotonic() - started:.1f} 秒"
-            if done.returncode == 0:
-                record(gate_id, name, "PASS", f"`{cmd}`（{seconds}）")
+            output = done.stdout + done.stderr
+            pattern = str(gate.get("count_pattern", "") or "")
+            if done.returncode == 0 and pattern:
+                # 終了コードが 0 でも、テストが1件も走っていなければ、何も確かめていない
+                matches = list(re.finditer(pattern, output, re.M))
+                ran = (sum(int(m.group(1)) for m in matches if m.group(1).isdigit())
+                       if re.compile(pattern).groups else len(matches))
+                if not matches:
+                    record(gate_id, name, "FAIL", f"`{cmd}` は終了コード 0 で終わりましたが、出力に count_pattern"
+                           f"（`{pattern}`）に合う行がありません。テストが実行されたかを確かめられません", output)
+                elif ran == 0:
+                    record(gate_id, name, "FAIL", f"`{cmd}` は終了コード 0 で終わりましたが、実行されたテストが "
+                           "0 件です。何も確かめていません", output)
+                else:
+                    record(gate_id, name, "PASS", f"`{cmd}`（{seconds}、{ran} 件）")
+            elif done.returncode == 0:
+                levels = gate.get("levels") or ([gate_id] if project and gate_id in project.test_levels else [])
+                record(gate_id, name, "PASS", f"`{cmd}`（{seconds}）"
+                       + ("　※実行した件数は確かめていません（count_pattern が未設定）" if levels else ""))
             else:
                 record(gate_id, name, "FAIL", f"`{cmd}` が終了コード {done.returncode} で失敗（{seconds}）",
                        done.stdout + done.stderr)

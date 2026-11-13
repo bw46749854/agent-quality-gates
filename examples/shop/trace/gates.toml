@@ -22,12 +22,14 @@ id = "unit"
 required = true
 name = "単体テスト"
 cmd = "PYTHONPATH=src python3 -m unittest discover -s tests/unit -q"
+count_pattern = 'Ran (\d+) tests?'
 
 [[gate]]
 id = "integration"
 required = true
 name = "結合テスト"
 cmd = "PYTHONPATH=src python3 -m unittest discover -s tests/integration -q"
+count_pattern = 'Ran (\d+) tests?'
 
 [[gate]]
 id = "e2e"

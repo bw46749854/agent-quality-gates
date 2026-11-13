@@ -13,6 +13,11 @@ ignore = ["examples/**"]
 # 例: quality_base = ["ruff.toml", "mypy.ini", ".gitlab-ci.yml"]
 quality_base = []
 
+# 比較の基準にするブランチ。人が内容を確かめて取り込むブランチの名前を書く。
+# 作業はここから分けたブランチで行い、検査は「このブランチとの分かれ目」と比べて、失われたもの・弱まったものを探す
+# （python3 tools/tracekit.py regress）。エージェントには、このブランチへ直接コミットさせない。
+base_branch = "main"
+
 requirements_dir = "docs/requirements"
 changes_dir = "docs/changes"
 matrix_file = "docs/traceability.md"

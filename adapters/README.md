@@ -17,6 +17,20 @@
 ゲートを実行しないと決めた場合は、区分（`skip_kind`）・理由（`skip_reason`）・承認した人の名前（`skip_approved_by`）を書きます。
 区分は、確かめる対象がないなら `not_applicable`、対象はあるが一時的に外すなら `waiver`（期限 `skip_until` が必須）です。
 必ず実行させたいゲートには `required = true` と書きます（理由や承認があっても外せなくなります）。
+
+テストを実行するゲートには `count_pattern` を書きます。コマンドの出力から「実行したテストの件数」を読む正規表現で、
+終了コードが 0 でも、件数が 0 か、件数を読めなければ不合格になります（対象のフォルダを間違えて何も実行していない、
+という状態を合格にしないため）。括弧があればその中の数を、なければ合う行の数を件数として数えます。
+出力の形は道具とその版で変わるので、一度実行して、合うことを確かめてください。
+
+| 道具 | `count_pattern` の例 |
+|---|---|
+| Python unittest | `'Ran (\d+) tests?'` |
+| pytest | `'(\d+) passed'` |
+| vitest | `'Tests\s+(\d+) passed'` |
+| jest | `'Tests:\s+(?:.*,\s+)?(\d+) passed'` |
+| go test（`-v` を付ける） | `'(?m)^--- PASS'` |
+| Gradle / Maven | 出力に件数が出ないので、結果ファイル（JUnit XML）を数えるコマンドをゲートに足す |
 ここにある例が正しい TOML であることは、検査ツール自身のテストが確かめています。
 
 ## Python
@@ -51,11 +65,13 @@ cmd = "lint-imports"  # import-linter。層・独立・禁止の契約を書け�
 id = "unit"
 name = "単体テスト"
 cmd = "pytest tests/unit -q"
+count_pattern = '(\d+) passed'
 
 [[gate]]
 id = "integration"
 name = "結合テスト"
 cmd = "pytest tests/integration -q"
+count_pattern = '(\d+) passed'
 ```
 
 `reference_patterns = ['^\s*(from|import)\s+myapp\.order\b']`
@@ -92,16 +108,19 @@ cmd = "npx depcruise src"  # dependency-cruiser。禁止する依存を規則と
 id = "unit"
 name = "単体テスト"
 cmd = "npx vitest run src"
+count_pattern = 'Tests\s+(\d+) passed'
 
 [[gate]]
 id = "integration"
 name = "結合テスト"
 cmd = "npx vitest run tests/integration"
+count_pattern = 'Tests\s+(\d+) passed'
 
 [[gate]]
 id = "e2e"
 name = "E2Eテスト"
 cmd = "npx playwright test"
+count_pattern = '(\d+) passed'
 ```
 
 `reference_patterns = ['from\s+"(@app|\.\.?(/\.\.)*)/order[/"]']`

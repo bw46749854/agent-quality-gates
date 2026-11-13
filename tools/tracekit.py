@@ -12,6 +12,7 @@ hook・pre-commit・CI は、すべてこのファイルの同じ検査を呼ぶ
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import datetime
 import json
@@ -19,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,7 +48,7 @@ CHG_STATUSES = ("active", "done", "abandoned")
 CHG_KINDS = ("feature", "fix", "refactor", "chore")
 REQ_KEYS = {"id", "title", "status", "priority", "components", "verify"}
 CHG_KEYS = {"id", "title", "status", "kind", "requirements", "components",
-            "quality_base", "approved_by"}
+            "quality_base", "accepts", "approved_by"}
 COMP_KEYS = {"id", "name", "responsibility", "paths", "depends_on",
              "reference_patterns", "status", "shared"}
 CHG_REQUIRED_SECTIONS = ("目的", "変更内容", "台帳に現れない影響の調査",
@@ -64,8 +66,8 @@ MAX_SHOWN_PER_CODE = 10  # 同じ種類の警告を、既定でいくつまで�
 # 設定（trace/config.toml の quality_base）で足すことはできるが、ここにあるものを外すことはできない。
 QUALITY_BASE = (
     "trace/gates.toml", "trace/config.toml", "trace/components.toml",
-    "tools/tracekit.py", "tools/verify.py", "tools/git-hooks/**", "tools/tests/test_tracekit.py",
-    ".github/workflows/**", ".github/CODEOWNERS", "CODEOWNERS",
+    "tools/tracekit.py", "tools/verify.py", "tools/git-hooks/**", "tools/tests/**",
+    ".github/workflows/**", ".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS",
     ".claude/settings.json", ".claude/hooks/**", ".claude/skills/**", ".claude/agents/**",
     "AGENTS.md", "CLAUDE.md",
 )
@@ -75,6 +77,11 @@ SKIP_KINDS = {
     "not_applicable": "対象なし",       # 確かめる対象がそもそもない（画面のないライブラリの E2E など）。期限は要らない
     "waiver": "期限つきの免除",         # 対象はあるが、一時的に外す。期限（skip_until）が要る
 }
+# 新しく出たら止める警告（要件・コード・テストの対応が欠けたことを示すもの）。
+# ほかの警告（粒度など、設計を見直す目安）は、新しく出ても止めずに報告する。以前からある警告は、どれも止めない。
+BLOCKING_NEW_WARNINGS = {"TEST-UNLINKED", "COMP-NOREQ", "TEST-DEPRECATED", "LEVEL-NOT-RUN"}
+# テストの中の「確かめる文」らしい行。言語に依らない目安で、減ったことを人に知らせるためだけに使う
+CHECKING_LINE = re.compile(r"(?im)^.*\b(?:assert\w*|expect\w*|should\w*|verify\w*|must\w*|require\w*)\b.*$")
 # doctor が hook を実際に呼んで確かめるときの合図（環境変数 TRACEKIT_PROBE があるとき、hook はこれを返す）
 PROBE_MARK = "tracekit-hook-probe-ok"
 
@@ -82,6 +89,7 @@ DEFAULT_CONFIG = {
     "source_roots": ["src"],
     "ignore": [],
     "quality_base": [],
+    "base_branch": "main",
     "requirements_dir": "docs/requirements",
     "changes_dir": "docs/changes",
     "matrix_file": "docs/traceability.md",
@@ -111,6 +119,7 @@ class Finding:
     code: str
     message: str
     where: str = ""
+    key: str = ""  # 警告の対象（コンポーネントID、テストファイルなど）。変更の前後で同じ警告かを見分ける
 
     def render(self) -> str:
         tag = "ERROR" if self.level == "error" else "WARN "
@@ -154,7 +163,8 @@ class Change:
     components: list[str]
     path: str
     quality_base: list[str] = field(default_factory=list)  # 変更してよい品質基盤のパス（glob）
-    approved_by: str = ""                                   # その変更を承認した人
+    accepts: list[str] = field(default_factory=list)       # 受け入れる後退（要件・受け入れ条件・テスト・警告の ID）
+    approved_by: str = ""                                   # quality_base と accepts を承認した人
 
 
 def glob_to_re(glob: str) -> re.Pattern:
@@ -280,6 +290,12 @@ def load_gates(root: Path) -> list[dict]:
         levels = gate.get("levels", [])
         if not isinstance(levels, list) or not all(isinstance(v, str) for v in levels):
             raise ConfigError(f"trace/gates.toml: ゲート `{gate_id}` の levels は文字列のリストで書いてください")
+        pattern = str(gate.get("count_pattern", "") or "")
+        try:
+            if re.compile(pattern).groups > 1:
+                raise re.error("グループは1つまでです")
+        except re.error as exc:
+            raise ConfigError(f"trace/gates.toml: ゲート `{gate_id}` の count_pattern が不正です: {exc}") from exc
         if not isinstance(gate.get("required", False), bool):
             raise ConfigError(f"trace/gates.toml: ゲート `{gate_id}` の required は true か false で書いてください")
         until = gate.get("skip_until") or None
@@ -491,6 +507,7 @@ class Project:
                 requirements = _as_list(meta.get("requirements"), "requirements")
                 components = _as_list(meta.get("components"), "components")
                 quality_base = _as_list(meta.get("quality_base"), "quality_base")
+                accepts = _as_list(meta.get("accepts"), "accepts")
             except (ValueError, UnicodeDecodeError, OSError) as exc:
                 self._err("CHG-FORMAT", str(exc), rel)
                 continue
@@ -514,6 +531,7 @@ class Project:
             result[cid] = Change(id=cid, title=str(meta.get("title", "")), status=status,
                                  kind=kind, requirements=requirements,
                                  components=components, path=rel, quality_base=quality_base,
+                                 accepts=accepts,
                                  approved_by=str(meta.get("approved_by", "")).strip())
         return result
 
@@ -633,8 +651,8 @@ def check(proj: Project, matrix: bool = True) -> list[Finding]:
     def err(code, message, where=""):
         findings.append(Finding("error", code, message, where))
 
-    def warn(code, message, where=""):
-        findings.append(Finding("warning", code, message, where))
+    def warn(code, message, where="", key=""):
+        findings.append(Finding("warning", code, message, where, key))
 
     comps, reqs = proj.components, proj.requirements
 
@@ -661,7 +679,7 @@ def check(proj: Project, matrix: bool = True) -> list[Finding]:
     for comp in comps.values():
         if comp.status == "active" and not proj.owned[comp.id]:
             warn("COMP-EMPTY", f"{comp.id} にコードがありません（設計段階なら status = \"planned\" にする）",
-                 "trace/components.toml")
+                 "trace/components.toml", comp.id)
 
     # -- 宣言していない依存（reference_patterns による、言語に依らない検査）
     used: dict[str, set[str]] = {cid: set() for cid in comps}
@@ -720,13 +738,13 @@ def check(proj: Project, matrix: bool = True) -> list[Finding]:
         for dep in comp.depends_on:
             if dep in comps and comps[dep].ref_res and dep not in used[comp.id]:
                 warn("DEP-UNUSED", f"{comp.id} は {dep} への依存を宣言していますが、参照が見つかりません",
-                     "trace/components.toml")
+                     "trace/components.toml", f"{comp.id}>{dep}")
 
     # -- テスト ⇔ 要件
     for test_file, refs in sorted(proj.test_refs.items()):
         if not refs:
             warn("TEST-UNLINKED", "要件IDが書かれていないテストファイルです（どの要件を検証するのか不明）",
-                 test_file)
+                 test_file, test_file)
         for rid, ac in sorted(refs):
             req = reqs.get(rid)
             if req is None:
@@ -734,7 +752,8 @@ def check(proj: Project, matrix: bool = True) -> list[Finding]:
             elif ac and ac not in req.acs:
                 err("TEST-DANGLING", f"{rid} に受け入れ条件 {ac} はありません", test_file)
             elif req.status == "deprecated":
-                warn("TEST-DEPRECATED", f"廃止された要件 {rid} を参照しています", test_file)
+                warn("TEST-DEPRECATED", f"廃止された要件 {rid} を参照しています", test_file,
+                     f"{test_file}>{rid}")
 
     # -- 要件
     for req in reqs.values():
@@ -796,13 +815,13 @@ def check(proj: Project, matrix: bool = True) -> list[Finding]:
                 "trace/gates.toml")
         elif count:
             warn("LEVEL-NOT-RUN", f"{level} のテストファイルが {count} 件ありますが、実行するゲートがありません。{how}",
-                 "trace/gates.toml")
+                 "trace/gates.toml", level)
 
     # -- 逆方向: 要件のないコンポーネント
     for comp in comps.values():
         if not comp.shared and not proj.reqs_of({comp.id}):
             warn("COMP-NOREQ", f"{comp.id} はどの要件にも結びついていません（不要な設計か、要件の書き漏れ）",
-                 "trace/components.toml")
+                 "trace/components.toml", comp.id)
 
     # -- 変更記録
     for change in proj.changes.values():
@@ -815,9 +834,11 @@ def check(proj: Project, matrix: bool = True) -> list[Finding]:
         if (change.kind in ("feature", "fix") and change.status != "abandoned"
                 and not change.requirements):
             err("CHG-NO-REQ", f"{change.id}: kind が {change.kind} の変更には、対象の要件が必要です", change.path)
-        if change.quality_base and not change.approved_by and change.status != "abandoned":
-            err("CHG-NO-APPROVER", f"{change.id}: 品質基盤（quality_base）を変更の範囲に入れていますが、"
-                "承認した人（approved_by）が書かれていません。人の承認を得て、その人の名前を書いてください",
+        if ((change.quality_base or change.accepts) and not change.approved_by
+                and change.status != "abandoned"):
+            err("CHG-NO-APPROVER", f"{change.id}: 品質基盤の変更（quality_base）か、後退の受け入れ（accepts）を"
+                "書いていますが、承認した人（approved_by）が書かれていません。利用者に説明して承認を得てから、"
+                "その人の名前を書いてください（承認が得られないなら、quality_base・accepts を消して、変更をやめます）",
                 change.path)
 
     # -- 粒度（粗すぎ・散らばりすぎ）
@@ -832,12 +853,12 @@ def check(proj: Project, matrix: bool = True) -> list[Finding]:
             if share > gran["max_requirement_share"]:
                 warn("GRAN-COARSE",
                      f"{comp.id} を変えると要件の {share:.0%} に影響します。境界が粗いか、依存が集まりすぎています"
-                     "（分割するか、意図した共有基盤なら shared = true）", "trace/components.toml")
+                     "（分割するか、意図した共有基盤なら shared = true）", "trace/components.toml", comp.id)
         for req in live:
             if len(req.components) > gran["max_components_per_requirement"]:
                 warn("GRAN-SCATTERED",
                      f"{req.id} が {len(req.components)} 個のコンポーネントにまたがっています。"
-                     "要件が大きすぎるか、責務が散らばっています", req.path)
+                     "要件が大きすぎるか、責務が散らばっています", req.path, req.id)
 
     # -- 生成物のマトリクスが古くないか
     if matrix:
@@ -1108,10 +1129,228 @@ def git_head(root: Path) -> str | None:
     return f"{head}（未コミットの変更あり）" if dirty else head
 
 
+# --------------------------------------------------------------------------- 後退の検出
+
+@contextlib.contextmanager
+def snapshot(root: Path, rev: str | None):
+    """rev の時点のプロジェクトを一時フォルダに取り出して読む。取り出せないときは None を渡す。
+
+    いまある台帳だけを見ていると、要件やテストを消しても「整合している」ように見える。
+    変更する前の状態と比べるために、変更する前のプロジェクトをそのまま読めるようにする。
+    """
+    if rev is None:
+        yield None
+        return
+    with tempfile.TemporaryDirectory(prefix="tracekit-base-") as tmp:
+        base = None
+        target = os.path.join(tmp, "tree")
+        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
+        try:
+            tree = _git(root, "rev-parse", "--verify", "-q", f"{rev}:./").strip()
+            for args in (("read-tree", tree), ("checkout-index", "-a", "--prefix=" + target + os.sep)):
+                subprocess.run(["git", "-C", str(root), *args], env=env, check=True, capture_output=True)
+            base = Project(target)
+        except (OSError, subprocess.CalledProcessError, ConfigError):
+            base = None  # 変更する前の台帳がない・読めない。比べられない
+        yield base
+
+
+def base_revision(proj: Project) -> str | None:
+    """比較の基準にするコミット。基準のブランチ（trace/config.toml の base_branch。既定は main）と、
+    いまの作業との分かれ目。作業をコミットしていても、していなくても、基準は動かない。
+
+    git の外、または最初のコミットの前なら None。基準のブランチがなければ、いまのコミット。
+    """
+    try:
+        head = _git(proj.root, "rev-parse", "--verify", "-q", "HEAD^{commit}").strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    branch = str(proj.cfg["base_branch"])
+    for name in (branch, f"origin/{branch}"):  # CI では、手元のブランチがなく origin/ の側だけがあることがある
+        try:
+            _git(proj.root, "rev-parse", "--verify", "-q", f"{name}^{{commit}}")
+        except subprocess.CalledProcessError:
+            continue
+        return diff_start(proj.root, name)
+    return head
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return a.read_bytes().replace(b"\r\n", b"\n") == b.read_bytes().replace(b"\r\n", b"\n")
+    except OSError:
+        return False
+
+
+def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
+    """変更する前（base）と比べて、失われたもの・弱まったものを挙げる。
+
+    items   承認が要るもの。変更記録の accepts に書かれ、承認した人（approved_by）が記録されていれば
+            承認済み（blocks = False）。そうでなければ不合格（blocks = True）。
+              - 内容の固まった要件がなくなった・状態が戻った・廃止された
+              - 受け入れ条件がなくなった、確かめるテストが1つもなくなった
+              - 要件を確かめていたテストファイルがなくなった（移しただけなら数えない）
+              - 完了済みの変更記録が消された・書き換えられた
+              - 対応の欠落を示す警告が、新しく出た（以前からある警告は数えない）
+    notes   不合格にはしないが、人が確かめるべきもの（テストの大幅な変更、設計の目安の警告など）。
+
+    strict（プルリクエスト）: 進行中の変更記録も、今回の変更で追加・更新されたものだけを有効とみなす。
+    変更する前にコンポーネントが1つもなければ（導入の途中）、何も挙げない。
+    """
+    report = {"compared": base is not None and bool(base.components), "items": [], "notes": [],
+              "resolved_warnings": [], "approvals": []}
+    if not report["compared"]:
+        return report
+
+    def fresh(change: Change) -> bool:  # 今回の変更で追加・更新された変更記録か
+        before = base.changes.get(change.id)
+        return before is None or not _same_file(proj.root / change.path, base.root / before.path)
+
+    def done_before(change: Change) -> bool:
+        return change.id in base.changes and base.changes[change.id].status == "done"
+
+    covering = [c for c in proj.changes.values() if not done_before(c) and (
+        (c.status == "active" and (not strict or fresh(c))) or (c.status == "done" and fresh(c)))]
+    accepted: dict[str, str] = {}
+    for change in covering:
+        if change.approved_by:
+            for item in change.accepts:
+                accepted.setdefault(item, f"{change.id}・{change.approved_by}")
+            if change.accepts or change.quality_base:
+                report["approvals"].append({
+                    "change": change.id, "approved_by": change.approved_by,
+                    "accepts": list(change.accepts), "quality_base": list(change.quality_base)})
+    seen: set[str] = set()
+
+    def item(item_id: str, what: str, parents: tuple = ()) -> None:
+        if item_id in seen:
+            return
+        seen.add(item_id)
+        by = next((accepted[key] for key in (item_id, *parents) if key in accepted), None)
+        report["items"].append({"id": item_id, "what": what, "blocks": by is None, "accepted_by": by})
+
+    # -- 要件と受け入れ条件
+    rank = {"draft": 0, "approved": 1, "implemented": 2}
+    ended: set[str] = set()  # 要件そのものが失われた・戻された。受け入れ条件ごとには挙げない
+    for rid, before in sorted(base.requirements.items()):
+        if before.status == "draft":
+            continue  # まだ固まっていなかった要件は、自由に変えてよい
+        now = proj.requirements.get(rid)
+        if now is None:
+            item(rid, f"要件 {rid}（{before.title}）がなくなりました（以前の状態: {before.status}）")
+        elif now.status == "deprecated" and before.status != "deprecated":
+            item(rid, f"要件 {rid}（{before.title}）が廃止（deprecated）になりました")
+        elif rank.get(now.status, 3) < rank.get(before.status, 3):
+            item(rid, f"要件 {rid}（{before.title}）の状態が {before.status} から {now.status} に戻されました"
+                      "（戻すと、受け入れ条件にテストがなくても検査を通るようになります）")
+        else:
+            for ac in before.acs:
+                if ac not in now.acs:
+                    item(f"{rid}/{ac}", f"受け入れ条件 {rid}/{ac} がなくなりました", (rid,))
+            continue
+        ended.add(rid)
+
+    # -- 受け入れ条件 ⇔ テスト の対応
+    for (rid, ac), before_files in sorted(base.ac_tests.items()):
+        before = base.requirements.get(rid)
+        if before is None or before.status == "draft" or rid in ended or ac not in before.acs:
+            continue
+        now_files = proj.ac_tests.get((rid, ac), set())
+        if not now_files:
+            item(f"{rid}/{ac}", f"受け入れ条件 {rid}/{ac} を確かめるテストが1つもなくなりました"
+                                f"（以前: {', '.join(sorted(before_files))}）", (rid,))
+        elif len(now_files) < len(before_files):
+            report["notes"].append(
+                f"{rid}/{ac} を確かめるテストが減りました: {', '.join(sorted(before_files - now_files))} から"
+                f"なくなり、残りは {', '.join(sorted(now_files))} です")
+
+    # -- テストファイル
+    added_refs = {ref for rel, refs in proj.test_refs.items() if rel not in base.test_refs for ref in refs}
+    for rel, refs in sorted(base.test_refs.items()):
+        if not refs or rel in proj.test_files:
+            continue
+        if refs <= added_refs:
+            continue  # 別のファイルに移しただけ（同じ要件IDが、新しいテストファイルにある）
+        owners = tuple(sorted({rid for rid, _ in refs} | {f"{rid}/{ac}" for rid, ac in refs if ac}))
+        covered = all(rid in accepted or f"{rid}/{ac}" in accepted for rid, ac in refs)
+        item(rel, f"テストファイル {rel} がなくなりました（確かめていたもの: "
+                  f"{', '.join(sorted(f'{rid}/{ac}' if ac else rid for rid, ac in refs))}）",
+             owners if covered else ())
+
+    # -- 完了済みの変更記録は履歴
+    for cid, before in sorted(base.changes.items()):
+        if before.status != "done":
+            continue
+        now = proj.changes.get(cid)
+        if now is None:
+            item(cid, f"完了済みの変更記録 {cid}（{before.title}）が消されました")
+        elif not _same_file(proj.root / now.path, base.root / before.path):
+            item(cid, f"完了済みの変更記録 {cid}（{before.title}）が書き換えられました"
+                      "（検証結果を含む履歴です。追記が必要なら、新しい変更記録に書いてください）")
+
+    # -- 警告: 件数ではなく、1件ずつ識別して比べる
+    def warnings(project: Project) -> dict[str, Finding]:
+        return {f"{f.code}:{f.key or f.message}": f for f in check(project, matrix=False) if f.level == "warning"}
+
+    before_w, now_w = warnings(base), warnings(proj)
+    report["resolved_warnings"] = sorted(set(before_w) - set(now_w))
+    for wid in sorted(set(now_w) - set(before_w)):
+        finding = now_w[wid]
+        if finding.code in BLOCKING_NEW_WARNINGS:
+            item(wid, f"新しい警告（以前はありませんでした）: {finding.message}"
+                      + (f" [{finding.where}]" if finding.where else ""))
+        else:
+            report["notes"].append(f"新しい警告（設計を見直す目安）: {finding.code}: {finding.message}")
+
+    # -- テストの大幅な変更。中身を抜いても要件IDが残っていれば、上の検査はどれも通る。機械では良し悪しを
+    #    決められないので、不合格にはせず、人とレビューの目に入るようにする
+    for rel in sorted(set(proj.test_files) & set(base.test_files)):
+        before_text, now_text = base.read_text(rel), proj.read_text(rel)
+        if before_text == now_text:
+            continue
+        before_checks, now_checks = len(CHECKING_LINE.findall(before_text)), len(CHECKING_LINE.findall(now_text))
+        before_lines = sum(1 for line in before_text.splitlines() if line.strip())
+        now_lines = sum(1 for line in now_text.splitlines() if line.strip())
+        if now_checks < before_checks or now_lines * 2 < before_lines:
+            report["notes"].append(
+                f"テスト {rel} が大きく変わっています: 確かめる文（assert / expect など）が {before_checks} → "
+                f"{now_checks} 行、全体が {before_lines} → {now_lines} 行。確かめる内容が弱まっていないか、"
+                "中身を読んで確かめてください")
+    return report
+
+
+def render_regress(report: dict, base_name: str = "変更する前") -> str:
+    out = [f"## 後退の検出（{base_name}との比較）", ""]
+    if not report["compared"]:
+        return "\n".join(out + ["比べていません（git の管理下にない、最初のコミットの前、"
+                                "または変更する前の台帳にコンポーネントがない導入の途中です）"]) + "\n"
+    blocking = [i for i in report["items"] if i["blocks"]]
+    accepted = [i for i in report["items"] if not i["blocks"]]
+    out.append(f"### 承認されていない後退（{len(blocking)} 件。このままでは不合格）")
+    out += [f"- {i['id']}: {i['what']}" for i in blocking] or ["- なし"]
+    if blocking:
+        out += ["", "意図した変更なら、利用者に説明して承認を得てから、変更記録の `accepts` に上の ID を、"
+                    "`approved_by` に承認した人の名前を書きます。意図していないなら、元に戻します。"]
+    out += ["", f"### 承認済みの後退（{len(accepted)} 件）"]
+    out += [f"- {i['id']}: {i['what']}（{i['accepted_by']}）" for i in accepted] or ["- なし"]
+    out += ["", f"### 確かめてほしい点（{len(report['notes'])} 件。不合格にはしません）"]
+    out += [f"- {note}" for note in report["notes"]] or ["- なし"]
+    out += ["", "### この変更で承認として記録されているもの"]
+    out += [f"- {a['change']}（承認: {a['approved_by']}）: "
+            + " / ".join(filter(None, [
+                "受け入れる後退 " + ", ".join(a["accepts"]) if a["accepts"] else "",
+                "品質基盤 " + ", ".join(a["quality_base"]) if a["quality_base"] else ""]))
+            for a in report["approvals"]] or ["- なし"]
+    if report["resolved_warnings"]:
+        out += ["", "### 解消した警告"] + [f"- {wid}" for wid in report["resolved_warnings"]]
+    return "\n".join(out) + "\n"
+
+
 # --------------------------------------------------------------------------- 変更の範囲の番人
 
 def guard(proj: Project, files, diff_files=None, strict: bool = False,
-          check_requirements: bool | None = None, base_rev: str = "HEAD") -> list[tuple[str, str]]:
+          check_requirements: bool | None = None, base_rev: str = "HEAD",
+          base: Project | None = None) -> list[tuple[str, str]]:
     """変更が、影響分析済みの変更記録の範囲に入っているかを調べる。
 
     - diff_files なし（編集の時点。hook）: 進行中の変更記録だけが有効。
@@ -1127,6 +1366,13 @@ def guard(proj: Project, files, diff_files=None, strict: bool = False,
     導入の途中（コンポーネントをまだ宣言していない）は、品質基盤の変更を調べない。導入の途中かどうかは、
     変更する前（base_rev。差分の起点）の台帳で決める。手元の台帳で決めると、台帳を空にするだけで保護が外れる。
     git の外、または最初のコミットの前では、手元の台帳で決める。
+
+    既存のテストの変更・削除も調べる。そのテストが確かめている要件のどれかが、有効な変更記録の
+    requirements に入っていること（通らないテストを、関係のない作業のついでに弱めさせない）。
+    新しいテストファイルと、要件IDのないテストファイルは調べない。
+
+    base（変更する前のプロジェクト。snapshot で得る）を渡すと、要件とテストを「変更する前の状態」でも見る。
+    要件を draft に戻してから書き換える、要件やテストのファイルごと消す、といった変更を見逃さないため。
     """
     changed = set(diff_files or ())
     if check_requirements is None:
@@ -1155,10 +1401,17 @@ def guard(proj: Project, files, diff_files=None, strict: bool = False,
     if check_requirements:
         recorded = {rid for change in covering for rid in change.requirements}
         by_path = {r.path: r for r in proj.requirements.values()}
+        base_by_path = {r.path: r for r in base.requirements.values()} if base is not None else {}
         for rel in files:
-            req = by_path.get(rel)
-            if req is not None and req.status != "draft" and req.id not in recorded:
-                problems.append((rel, f"{req.id}（{req.status}）が変更されていますが、どの変更記録の "
+            now, before = by_path.get(rel), base_by_path.get(rel)
+            req = now or before
+            # 変更する前か後のどちらかで内容が固まっていれば、変更記録が要る（draft に戻してから変える、を通さない）
+            settled = any(r is not None and r.status != "draft" for r in (now, before))
+            if req is not None and settled and req.id not in recorded:
+                state = ("削除" if now is None else
+                         now.status if before is None or before.status == now.status else
+                         f"{before.status} → {now.status}")
+                problems.append((rel, f"{req.id}（{state}）が変更されていますが、どの変更記録の "
                                       "requirements にも入っていません。要件の変更は影響分析の対象です。"
                                       f"変更記録の requirements に {req.id} を加え、この要件を参照するテストと"
                                       "コンポーネントへの影響を調べてください"
@@ -1192,6 +1445,19 @@ def guard(proj: Project, files, diff_files=None, strict: bool = False,
                                   "（手順: .claude/skills/analyze-impact/SKILL.md）。"
                                   "進行中の変更の範囲が広がった場合は、その記録の components と影響分析を更新してください"))
 
+    in_scope = {rid for change in covering for rid in change.requirements}
+    for rel in files:
+        if proj.test_level(rel) is None:
+            continue
+        refs = (base.test_refs if base is not None else proj.test_refs).get(rel) or ()
+        verified = sorted({rid for rid, _ in refs})
+        if verified and not in_scope.intersection(verified):
+            problems.append((rel, f"{', '.join(verified)} を確かめているテストです。変える・消すには、その要件を "
+                                  "requirements に含む変更記録が要ります（関係のない作業のついでに、テストを"
+                                  "書き換えたり消したりしないための確認です）。この要件の変更なら、変更記録の "
+                                  f"requirements に {verified[0]} を加えて、影響分析を更新してください"
+                                  "（手順: .claude/skills/analyze-impact/SKILL.md）"))
+
     guarded = False
     if any(proj.is_quality_base(rel) for rel in files):
         committed = committed_components(proj.root, base_rev)
@@ -1211,10 +1477,12 @@ def guard(proj: Project, files, diff_files=None, strict: bool = False,
                                       "今回の変更について承認を得て、変更記録に書いてください"))
                 continue
             problems.append((rel, "品質基盤（検査の定義・台帳・検査ツール・hook・CI・行動規約）の変更です。ここを変えると"
-                                  "検査そのものが弱まりうるので、人の承認が必要です。何をなぜ変えるのかを利用者に"
-                                  "説明して承認を得てから、変更記録の quality_base にこのパスを、approved_by に"
-                                  "承認した人の名前を書いてください（新しく作る場合: `python3 tools/tracekit.py "
-                                  f"change new --title \"…\" --kind chore --quality-base {rel} --approved-by 名前`）。"
+                                  "検査そのものが弱まりうるので、人の承認が必要です。(1) 何をなぜ変えるのかを利用者に"
+                                  "説明する。(2) 変更記録の quality_base にこのパスを書く（新しく作る場合: "
+                                  "`python3 tools/tracekit.py change new --title \"…\" --kind chore "
+                                  f"--quality-base {rel}`）。(3) 承認が得られたら、その変更記録の approved_by に"
+                                  "承認した人の名前を、Edit で書く（Claude Code では、このとき利用者に確認の"
+                                  "ダイアログが出ます。シェルから書き込んではいけません）。"
                                   "承認を得ていない人の名前を書いてはいけません"))
     return problems
 
@@ -1250,16 +1518,15 @@ components: [{components}]
 
 def change_new(proj: Project, title: str, kind: str, components: list[str],
                requirements: list[str], quality_base: list[str] | tuple = (),
-               approved_by: str = "") -> Path:
+               approved_by: str = "", accepts: list[str] | tuple = ()) -> Path:
     problems = [f"コンポーネント {c} は台帳にありません" for c in components if c not in proj.components]
     problems += [f"要件 {r} は存在しません" for r in requirements if r not in proj.requirements]
     if kind in ("feature", "fix") and not requirements:
         problems.append(f"kind が {kind} の変更には --requirements が必要です")
     approved_by = " ".join(approved_by.split())
-    if quality_base and not approved_by:
-        problems.append("品質基盤（--quality-base）を変えるには、承認した人の名前（--approved-by）が必要です")
-    if approved_by and not quality_base:
-        problems.append("--approved-by は、--quality-base（変更する品質基盤のパス）と一緒に指定します")
+    if approved_by and not (quality_base or accepts):
+        problems.append("承認した人（approved_by）は、品質基盤の変更（quality_base）か、後退の受け入れ（accepts）と"
+                        "一緒に書きます")
     if problems:
         raise ConfigError("変更記録を作れません: " + " / ".join(problems))
     numbers = [int(cid.split("-")[1]) for cid in proj.changes]
@@ -1276,8 +1543,11 @@ def change_new(proj: Project, title: str, kind: str, components: list[str],
     path.write_text(CHANGE_TEMPLATE.format(
         id=change_id, title=title.replace("\n", " "), kind=kind,
         requirements=", ".join(requirements), components=", ".join(components),
-        approval=(f"quality_base: [{', '.join(quality_base)}]\napproved_by: {approved_by}\n"
-                  if quality_base else ""),
+        approval="".join([
+            f"quality_base: [{', '.join(quality_base)}]\n" if quality_base else "",
+            f"accepts: [{', '.join(accepts)}]\n" if accepts else "",
+            # 承認した人は、承認を得てから書く（Claude Code では、書くときに利用者へ確認のダイアログが出る）
+            f"approved_by: {approved_by}\n" if quality_base or accepts else ""]),
         impact=render_impact(proj, impact)), encoding="utf-8")
     return path
 
@@ -1349,6 +1619,14 @@ def change_close(proj: Project, change_id: str, echo=print) -> bool:
 
 # --------------------------------------------------------------------------- 現在地
 
+def _current_branch(root: Path) -> str | None:
+    """いまのブランチ名。ブランチの上にいなければ空文字。git の外なら None。"""
+    try:
+        return _git(root, "branch", "--show-current").strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def render_status(proj: Project) -> str:
     findings = check(proj, matrix=False)
     errors = sum(1 for f in findings if f.level == "error")
@@ -1370,6 +1648,13 @@ def render_status(proj: Project) -> str:
                 f"要件: {', '.join(c.requirements) or 'なし'}）→ {c.path}" for c in active]
     else:
         out.append("- 進行中の変更: なし。本番コードを編集する前に、影響分析をして変更記録を作ること")
+    branch = _current_branch(proj.root)
+    if branch is not None:
+        base_branch = str(proj.cfg["base_branch"])
+        out.append(f"- 比較の基準: {base_branch}／いまのブランチ: {branch or '（ブランチなし）'}"
+                   + ("。**基準のブランチの上にいます。変更は作業ブランチを作って行うこと**"
+                      f"（`git switch -c 作業の名前`）。{base_branch} への取り込みは利用者が行う"
+                      if branch == base_branch else ""))
     not_ready = [item for state, item, _ in doctor(proj.root, proj, live=False) if state == "NG"]
     if not_ready:
         out.append(f"- 導入の確認: {'、'.join(not_ready)} に対処が必要です"
@@ -1482,7 +1767,19 @@ def doctor(root: Path, proj: "Project | None" = None, ci: bool = False,
     except (OSError, subprocess.CalledProcessError):
         inside = False
     add(inside, "git", "git の管理下にあります",
-        "git の管理下にありません。コミット前の検査と、差分からの影響分析が働きません")
+        "git の管理下にありません。コミット前の検査、差分からの影響分析、変更前との比較（後退の検出）が働きません")
+    if inside:
+        base_branch, branch = str(proj.cfg["base_branch"]), _current_branch(root)
+        try:
+            _git(root, "rev-parse", "--verify", "-q", f"{base_branch}^{{commit}}")
+            out.append(("OK", "比較の基準", f"{base_branch}（いまのブランチ: {branch or 'なし'}）"
+                        + ("。基準のブランチの上にいます。変更は作業ブランチで行い、取り込みは人が行ってください"
+                           if branch == base_branch else "")))
+        except (OSError, subprocess.CalledProcessError):
+            out.append(("WARN", "比較の基準",
+                        f"基準のブランチ `{base_branch}` がありません。後退の検出は、直前のコミットとしか比べられません"
+                        "（コミットされた後退を見逃します）。trace/config.toml の base_branch を、"
+                        "人が取り込みを行うブランチの名前にしてください"))
     if inside and not ci:
         try:
             hooks_path = _git(root, "config", "--get", "core.hooksPath").strip()
@@ -1523,6 +1820,15 @@ def doctor(root: Path, proj: "Project | None" = None, ci: bool = False,
                ("INFO", "CI", f"GitHub Actions の設定に {' と '.join(lacking)} の実行が見つかりません"
                 "（コメントの中や、echo で表示しているだけのものは数えません）。"
                 "ほかの CI を使っている場合は、両方を実行していることを確かめてください"))
+
+    bash_seen = _pre_edit_sees_bash(root)
+    out.append(("INFO", "承認の確認",
+                "品質基盤の変更と後退の受け入れは、変更記録に承認した人を書くときに、Claude Code が利用者へ確認の"
+                "ダイアログを出します（Edit / Write で書く場合）。"
+                + ("シェルのコマンドで書き込む場合にも確認を出します。" if bash_seen else
+                   "シェルのコマンドで書き込まれた場合は確認が出ません。出すには、.claude/settings.json の PreToolUse の "
+                   "matcher に `Bash` を足してください（`Edit|Write|NotebookEdit|Bash`）。")
+                + "どちらの場合も、承認として記録されたものは `python3 tools/tracekit.py regress` の報告に載ります"))
 
     owners = next((name for name in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
                    if (root / name).is_file()), None)
@@ -1599,6 +1905,21 @@ def _hook_wiring(root: Path) -> tuple[dict[str, str], list[str], list[str]]:
     return wired, missing, unreadable
 
 
+def _pre_edit_sees_bash(root: Path) -> bool:
+    """編集を止める hook が、シェルのコマンド（Bash）にも掛かっているか。"""
+    for name in ("settings.json", "settings.local.json"):
+        try:
+            data = json.loads((root / ".claude" / name).read_text(encoding="utf-8"))
+            entries = data["hooks"]["PreToolUse"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        for entry in entries if isinstance(entries, list) else []:
+            if (isinstance(entry, dict) and "pre_edit.py" in json.dumps(entry.get("hooks", ""))
+                    and _matcher_covers(str(entry.get("matcher") or ""), "Bash")):
+                return True
+    return False
+
+
 def _probe_hooks(root: Path, wired: dict[str, str]) -> list[str]:
     """設定されたコマンドを、そのまま実際に呼ぶ。hook の本体が応答しなかったものを返す。
 
@@ -1672,6 +1993,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--strict", action="store_true",
                    help="プルリクエスト用。進行中の変更記録も、この差分で追加・更新されたものだけを有効とみなす")
 
+    p = sub.add_parser("regress", help="変更する前と比べて、失われたもの・弱まったものを報告する（後退の検出）")
+    p.add_argument("--base", help="比べる相手の git リビジョン（既定: trace/config.toml の base_branch との分かれ目）")
+    p.add_argument("--strict", action="store_true", help="プルリクエスト用（guard --strict と同じ）")
+    p.add_argument("--format", choices=("md", "json"), default="md")
+
     p = sub.add_parser("change", help="変更記録（影響分析の記録）を扱う")
     csub = p.add_subparsers(dest="change_command", required=True)
     c = csub.add_parser("new")
@@ -1680,8 +2006,9 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--components", default="")
     c.add_argument("--requirements", default="")
     c.add_argument("--quality-base", default="",
-                   help="変更する品質基盤のパス（カンマ区切り。glob 可）。--approved-by が必要")
-    c.add_argument("--approved-by", default="", help="品質基盤の変更を承認した人の名前")
+                   help="変更する品質基盤のパス（カンマ区切り。glob 可）。承認した人は、承認を得てから変更記録に書く")
+    c.add_argument("--accepts", default="",
+                   help="受け入れる後退の ID（カンマ区切り。`regress` が挙げたもの）。承認した人は、承認を得てから書く")
     c = csub.add_parser("close")
     c.add_argument("id")
     c = csub.add_parser("abandon")
@@ -1749,17 +2076,33 @@ def main(argv: list[str] | None = None) -> int:
             if args.strict and diff_files is None:
                 raise ConfigError("--strict は --base か --staged と一緒に使います")
             base_rev = diff_start(proj.root, args.base) if args.base and not args.staged else "HEAD"
-            problems = guard(proj, files, diff_files, strict=args.strict, base_rev=base_rev)
+            with snapshot(proj.root, base_rev if diff_files is not None else None) as base:
+                problems = guard(proj, files, diff_files, strict=args.strict, base_rev=base_rev, base=base)
+                # 差分を調べるとき（コミット前・CI）は、変更する前と比べた後退も調べる
+                problems += [(item["id"], item["what"] + "。意図した変更なら、利用者の承認を得て、変更記録の "
+                              f"accepts に `{item['id']}` を、approved_by に承認した人の名前を書いてください")
+                             for item in regress(proj, base, strict=args.strict)["items"] if item["blocks"]]
             for rel, message in problems:
                 print(f"BLOCK {rel}: {message}")
             if not problems:
                 print("変更はすべて、変更記録の範囲内です")
             return 1 if problems else 0
 
+        if args.command == "regress":
+            rev = diff_start(proj.root, args.base) if args.base else base_revision(proj)
+            with snapshot(proj.root, rev) as base:
+                report = regress(proj, base, strict=args.strict)
+            if args.format == "json":
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+            else:
+                print(render_regress(report, args.base or str(proj.cfg["base_branch"])), end="")
+            return 1 if any(item["blocks"] for item in report["items"]) else 0
+
         if args.command == "change":
             if args.change_command == "new":
                 path = change_new(proj, args.title, args.kind, _csv(args.components),
-                                  _csv(args.requirements), _csv(args.quality_base), args.approved_by)
+                                  _csv(args.requirements), _csv(args.quality_base),
+                                  accepts=_csv(args.accepts))
                 print(f"{path.relative_to(proj.root).as_posix()} を作りました。"
                       "空欄（<!-- --> の部分）を埋めてから実装に進んでください")
                 return 0
@@ -1778,7 +2121,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.change_command == "list":
                 for change in sorted(proj.changes.values(), key=lambda c: c.id):
-                    scope = change.components + [f"品質基盤 {g}" for g in change.quality_base]
+                    scope = (change.components + [f"品質基盤 {g}" for g in change.quality_base]
+                             + [f"後退の受け入れ {a}" for a in change.accepts])
                     print(f"{change.id} [{change.status}] {change.kind}: {change.title} "
                           f"（{', '.join(scope) or '範囲なし'}）")
                 return 0

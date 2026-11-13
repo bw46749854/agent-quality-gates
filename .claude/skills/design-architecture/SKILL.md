@@ -26,9 +26,11 @@ description: 要件をどのコンポーネントが担うかを決めるとき�
        --quality-base trace/components.toml
    ```
    新しいコンポーネントは、台帳に書いたあとで、変更記録の `components` に足す（影響分析の工程で行う）。
-   導入の途中（コンポーネントを宣言した台帳を、まだ一度もコミットしていない）なら、この手順は要らない。
-6. **台帳と設計書を更新する。** `trace/components.toml` にコンポーネント（`id`・`name`・`responsibility`・`paths`・`depends_on`・`reference_patterns`）を書き、`docs/architecture.md` の該当する節を直し、要件の `components` を埋める。まだコードがないコンポーネントは `status = "planned"` にする。
-7. **`python3 tools/tracekit.py check` を実行する。** 循環、重なり、知らない依存先のエラーと、粒度の警告（`GRAN-COARSE`、`GRAN-SCATTERED`）を確かめる。
+   導入の途中（コンポーネントを宣言した台帳が、まだ基準のブランチにない）なら、承認の**記録**（`quality_base`・`approved_by`）は
+   要らない。ただし、コンポーネントの構成は設計の骨格なので、構成の案と選ばなかった案を利用者に示して確認することは、
+   導入の途中でも同じ（利用者がその場にいない実行では、報告の冒頭に「確認が要る点」として書く）。
+6. **台帳と設計書を更新する。** `trace/components.toml` にコンポーネント（`id`・`name`・`responsibility`・`paths`・`depends_on`・`reference_patterns`）を書き、`docs/architecture.md` の該当する節を直し、要件の `components` を埋める。同じ変更の中でコードを書くコンポーネントは、`status` を書かない（コードができるまで `COMP-EMPTY` の警告が出るが、止まらない）。`status = "planned"` は、設計だけを先に取り込むときに使う（あとで外すのも台帳の変更なので、承認の範囲に入れておく）。
+7. **`python3 tools/tracekit.py check --no-matrix` を実行する。** 循環、重なり、知らない依存先のエラーと、粒度の警告（`GRAN-COARSE`、`GRAN-SCATTERED`）を確かめる。
 8. **`design-reviewer` サブエージェントにレビューを頼む**（コンポーネント・依存・公開インターフェースを変えたとき）。指摘を直すか、直さない理由を設計判断として残す。
 9. **レビューを受けて台帳を直した場合は、承認を得た内容から変わった点を利用者に伝える。**
 

@@ -106,8 +106,8 @@ python3 tools/tracekit.py regress     # 何が失われたか、何が弱まっ�
 実装が済んだら、実際の差分から影響範囲を取り直し、変更前の見立てと比べる。
 
 ```bash
-python3 tools/tracekit.py impact --base HEAD
-python3 tools/tracekit.py impact --base HEAD --format tests   # 実行すべきテストの一覧だけ
+python3 tools/tracekit.py impact --base main                  # 基準のブランチとの差分（コミット済みの変更も含む）
+python3 tools/tracekit.py impact --base main --format tests   # 実行すべきテストの一覧だけ
 ```
 
 見立てになかったコンポーネントや要件が挙がったら、変更記録を直す。

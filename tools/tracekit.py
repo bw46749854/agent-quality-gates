@@ -1003,6 +1003,7 @@ def compute_impact(proj: Project, files=(), components=(), requirements=()) -> d
         "unowned_files": sorted(unowned),
         "untested_requirements": untested,
         "quality_base_files": sorted(quality_base),
+        "quality_guarded": quality_guarded(proj),
         "ledger_changed": ledger_changed,
         "unknown_components": unknown_components,
         "unknown_requirements": unknown_requirements,
@@ -1046,7 +1047,10 @@ def render_impact(proj: Project, impact: dict, heading: str = "## 影響分析�
     if impact["quality_base_files"]:
         notes.append("品質基盤（検査の定義・検査ツール・hook・CI・行動規約）が変わっています: "
                      + ", ".join(impact["quality_base_files"])
-                     + "。人の承認と、変更記録の quality_base・approved_by への記録が必要です")
+                     + ("。人の承認と、変更記録の quality_base・approved_by への記録が必要です"
+                        if impact.get("quality_guarded", True) else
+                        "。導入の途中（コンポーネントを宣言した台帳を、まだコミットしていない）なので、"
+                        "承認の記録は要りません。構成そのものは、利用者に確認してください"))
     if impact["ledger_changed"]:
         notes.append("台帳（trace/）自体が変わっています。全体の再検証が必要です")
     if impact["unknown_components"]:
@@ -1094,6 +1098,12 @@ def committed_components(root: Path, rev: str = "HEAD") -> bool | None:
         return bool(tomllib.loads(text).get("component"))
     except tomllib.TOMLDecodeError:
         return True  # 読めない台帳。導入の途中とはみなさない
+
+
+def quality_guarded(proj: "Project", rev: str = "HEAD") -> bool:
+    """品質基盤の変更に、承認の記録を求める状態か（導入の途中ではないか）。変更する前の台帳で決める。"""
+    committed = committed_components(proj.root, rev)
+    return bool(proj.components) if committed is None else committed
 
 
 def git_changed(root: Path, base: str | None = None, staged: bool = False) -> list[str]:
@@ -1199,8 +1209,14 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
     strict（プルリクエスト）: 進行中の変更記録も、今回の変更で追加・更新されたものだけを有効とみなす。
     変更する前にコンポーネントが1つもなければ（導入の途中）、何も挙げない。
     """
-    report = {"compared": base is not None and bool(base.components), "items": [], "notes": [],
+    report = {"compared": base is not None and bool(base.components), "reason": "", "items": [], "notes": [],
               "resolved_warnings": [], "approvals": []}
+    if base is None:
+        report["reason"] = ("変更する前の状態を取り出せません（git の管理下にない、最初のコミットの前、"
+                            "または変更する前の台帳を読めない、のどれかです）")
+    elif not base.components:
+        report["reason"] = ("変更する前（基準のブランチとの分かれ目）の台帳に、まだコンポーネントがありません。"
+                            "導入の途中とみなします。コンポーネントを宣言した台帳が基準のブランチに取り込まれてから、比べ始めます")
     if not report["compared"]:
         return report
 
@@ -1324,8 +1340,7 @@ def regress(proj: Project, base: Project | None, strict: bool = False) -> dict:
 def render_regress(report: dict, base_name: str = "変更する前") -> str:
     out = [f"## 後退の検出（{base_name}との比較）", ""]
     if not report["compared"]:
-        return "\n".join(out + ["比べていません（git の管理下にない、最初のコミットの前、"
-                                "または変更する前の台帳にコンポーネントがない導入の途中です）"]) + "\n"
+        return "\n".join(out + [f"比べていません。{report['reason']}"]) + "\n"
     blocking = [i for i in report["items"] if i["blocks"]]
     accepted = [i for i in report["items"] if not i["blocks"]]
     out.append(f"### 承認されていない後退（{len(blocking)} 件。このままでは不合格）")
@@ -1462,8 +1477,7 @@ def guard(proj: Project, files, diff_files=None, strict: bool = False,
 
     guarded = False
     if any(proj.is_quality_base(rel) for rel in files):
-        committed = committed_components(proj.root, base_rev)
-        guarded = bool(proj.components) if committed is None else committed
+        guarded = quality_guarded(proj, base_rev)
     if guarded:
         def approving(changes: list[Change], rel: str) -> Change | None:
             return next((c for c in changes if c.approved_by
@@ -1801,7 +1815,9 @@ def doctor(root: Path, proj: "Project | None" = None, ci: bool = False,
     dead = _probe_hooks(root, wired) if probe else []
     if not not_wired and not unreadable and not dead:
         out.append(("OK", "Claude Code の hook", "3本とも、働くイベントに設定されています"
-                    + ("。設定されたコマンドを実際に呼び、応答することを確かめました" if probe else
+                    + ("。設定されたコマンドを doctor が呼び、応答することを確かめました"
+                       "（いまのセッションで働いているかは、セッションの冒頭に「品質ゲートの現在地」が出たかで分かります）"
+                       if probe else
                        "（設定の文面だけを見ました。実際に呼んで確かめてはいません）")))
     else:
         problems = [f"{name} を JSON として読めません（壊れていると、hook は1本も働きません）" for name in unreadable]

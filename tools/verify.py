@@ -79,6 +79,8 @@ def run_gates(root: Path, only: list[str] | None = None, echo=print) -> tuple[li
                        + ("（`python3 tools/tracekit.py regress` で内容を確認する）"
                           if report["items"] or report["notes"] else ""),
                        tracekit.render_regress(report, base_name))
+            else:  # ゲートの結果には数えない。比べていないことだけは、黙らずに知らせる
+                echo(f"[INFO] regress（後退の検出）: 比べていません。{report['reason']}")
         except tracekit.ConfigError:
             pass  # 台帳を読めないことは、上の trace が不合格にしている
 

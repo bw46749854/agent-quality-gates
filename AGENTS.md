@@ -16,7 +16,6 @@
 | 変更の影響分析 | `docs/changes/CHG-*.md` | hook（記録のない編集を止める）、`tracekit.py guard` |
 | テストによる検証 | テストコードと `trace/gates.toml` | `verify.py`、テストレビュー |
 | 品質基盤（ゲートの定義、台帳、検査ツール、hook、CI、この行動規約） | `trace/gates.toml`、`trace/config.toml`、`trace/components.toml`、`tools/`、`.github/workflows/`、`.claude/`、`AGENTS.md` | hook、`tracekit.py guard`（承認の記録のない変更を止める） |
-
 | 以前あった保証（要件・受け入れ条件・テスト・その対応） | 基準のブランチ（`trace/config.toml` の `base_branch`。既定は `main`）の状態 | `tracekit.py regress`、`tracekit.py guard`、`verify.py` の `regress` ゲート（承認のない後退を止める） |
 
 `docs/traceability.md` は生成物です。手で編集しません。
@@ -71,7 +70,7 @@ python3 tools/tracekit.py status                 # 進行中の変更と検査�
 python3 tools/tracekit.py doctor                 # hook・コミット前の検査・ゲートが実際に働く状態か
 python3 tools/tracekit.py check                  # 台帳・コード・テストの整合を検査
 python3 tools/tracekit.py impact --components COMP-X     # 変更前: 影響範囲と実行すべきテスト
-python3 tools/tracekit.py impact --base HEAD             # 変更後: 差分から影響範囲を抽出
+python3 tools/tracekit.py impact --base main             # 変更後: 基準のブランチとの差分から影響範囲を抽出
 python3 tools/tracekit.py change new --title "…" --kind fix --components COMP-X --requirements REQ-001
 python3 tools/tracekit.py change new --title "…" --kind chore --quality-base trace/gates.toml   # 品質基盤を変えるとき（承認した人は、承認を得てから Edit で書く）
 python3 tools/tracekit.py regress                # 基準のブランチと比べて、失われたもの・弱まったもの（後退）を報告する
